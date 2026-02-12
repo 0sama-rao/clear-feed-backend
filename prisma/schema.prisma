@@ -1,0 +1,95 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum SourceType {
+  RSS
+  WEBSITE
+}
+
+model User {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  password   String
+  name       String
+  role       Role     @default(USER)
+  digestTime String   @default("06:00")
+  createdAt  DateTime @default(now())
+
+  sources       Source[]
+  keywords      Keyword[]
+  userArticles  UserArticle[]
+  refreshTokens RefreshToken[]
+}
+
+model Source {
+  id        String     @id @default(uuid())
+  userId    String
+  url       String
+  name      String
+  type      SourceType
+  active    Boolean    @default(true)
+  createdAt DateTime   @default(now())
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  articles Article[]
+}
+
+model Keyword {
+  id        String   @id @default(uuid())
+  userId    String
+  word      String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Article {
+  id          String    @id @default(uuid())
+  sourceId    String
+  title       String
+  url         String    @unique
+  content     String
+  summary     String?
+  publishedAt DateTime?
+  scrapedAt   DateTime  @default(now())
+
+  source       Source        @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  userArticles UserArticle[]
+}
+
+model UserArticle {
+  id              String    @id @default(uuid())
+  userId          String
+  articleId       String
+  matched         Boolean   @default(false)
+  matchedKeywords String[]
+  sent            Boolean   @default(false)
+  sentAt          DateTime?
+  read            Boolean   @default(false)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, articleId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}

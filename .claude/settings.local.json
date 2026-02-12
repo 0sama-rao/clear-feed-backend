@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(docker compose:*)",
+      "Bash(npx prisma migrate:*)",
+      "Bash(npx prisma db seed:*)",
+      "Bash(npx prisma db push:*)",
+      "Bash(taskkill:*)",
+      "Bash(curl:*)",
+      "Bash(TOKEN=\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwNTg0ZWE5OS0xNzI4LTRiNzktOTY0OC1mNTdjMzY0YzhmZjIiLCJyb2xlIjoiQURNSU4iLCJpYXQiOjE3NzA5MjExODQsImV4cCI6MTc3MDkyMjA4NH0.bIw9tnEhS_lBtVfX9aUKycppboSc-C4f0RThoXy6Y-M\")"
+    ]
+  }
+}
