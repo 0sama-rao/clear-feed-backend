@@ -17,6 +17,14 @@ enum SourceType {
   WEBSITE
 }
 
+enum EntityType {
+  COMPANY
+  PERSON
+  PRODUCT
+  GEOGRAPHY
+  SECTOR
+}
+
 model User {
   id         String   @id @default(uuid())
   email      String   @unique
@@ -26,10 +34,16 @@ model User {
   digestTime String   @default("06:00")
   createdAt  DateTime @default(now())
 
+  // v2: onboarding
+  industryId String?
+  onboarded  Boolean  @default(false)
+
   sources       Source[]
   keywords      Keyword[]
   userArticles  UserArticle[]
   refreshTokens RefreshToken[]
+  newsGroups    NewsGroup[]
+  industry      Industry? @relation(fields: [industryId], references: [id])
 }
 
 model Source {
@@ -64,8 +78,19 @@ model Article {
   publishedAt DateTime?
   scrapedAt   DateTime  @default(now())
 
-  source       Source        @relation(fields: [sourceId], references: [id], onDelete: Cascade)
-  userArticles UserArticle[]
+  // v2: enhanced ingestion fields
+  author            String?
+  tags              String[]
+  guid              String?
+  rawHtml           String?   @db.Text
+  cleanText         String?   @db.Text
+  externalLinks     String[]
+  entitiesExtracted Boolean   @default(false)
+
+  source         Source          @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  userArticles   UserArticle[]
+  entities       ArticleEntity[]
+  articleSignals ArticleSignal[]
 }
 
 model UserArticle {
@@ -78,8 +103,12 @@ model UserArticle {
   sentAt          DateTime?
   read            Boolean   @default(false)
 
-  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  // v2: group assignment
+  newsGroupId String?
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  article   Article    @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  newsGroup NewsGroup? @relation(fields: [newsGroupId], references: [id], onDelete: SetNull)
 
   @@unique([userId, articleId])
 }
@@ -92,4 +121,108 @@ model RefreshToken {
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ──────────────────────────────────────────
+// V2: Industry & Onboarding
+// ──────────────────────────────────────────
+
+model Industry {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+
+  signals         IndustrySignal[]
+  users           User[]
+  defaultSources  IndustryDefaultSource[]
+  defaultKeywords IndustryDefaultKeyword[]
+}
+
+model IndustrySignal {
+  id          String   @id @default(uuid())
+  industryId  String
+  name        String
+  slug        String
+  description String?
+  createdAt   DateTime @default(now())
+
+  industry       Industry        @relation(fields: [industryId], references: [id], onDelete: Cascade)
+  articleSignals ArticleSignal[]
+
+  @@unique([industryId, slug])
+}
+
+model IndustryDefaultSource {
+  id         String     @id @default(uuid())
+  industryId String
+  url        String
+  name       String
+  type       SourceType
+
+  industry Industry @relation(fields: [industryId], references: [id], onDelete: Cascade)
+
+  @@unique([industryId, url])
+}
+
+model IndustryDefaultKeyword {
+  id         String @id @default(uuid())
+  industryId String
+  word       String
+
+  industry Industry @relation(fields: [industryId], references: [id], onDelete: Cascade)
+
+  @@unique([industryId, word])
+}
+
+// ──────────────────────────────────────────
+// V2: Entity Extraction & Signal Classification
+// ──────────────────────────────────────────
+
+model ArticleEntity {
+  id         String     @id @default(uuid())
+  articleId  String
+  type       EntityType
+  name       String
+  confidence Float      @default(1.0)
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@index([type, name])
+}
+
+model ArticleSignal {
+  id               String @id @default(uuid())
+  articleId        String
+  industrySignalId String
+  confidence       Float  @default(1.0)
+
+  article        Article        @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  industrySignal IndustrySignal @relation(fields: [industrySignalId], references: [id], onDelete: Cascade)
+
+  @@unique([articleId, industrySignalId])
+}
+
+// ──────────────────────────────────────────
+// V2: News Groups (Story Clusters)
+// ──────────────────────────────────────────
+
+model NewsGroup {
+  id               String   @id @default(uuid())
+  userId           String
+  title            String
+  synopsis         String?  @db.Text
+  executiveSummary String?  @db.Text
+  impactAnalysis   String?  @db.Text
+  actionability    String?  @db.Text
+  confidence       Float    @default(0.0)
+  date             DateTime @default(now())
+  createdAt        DateTime @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userArticles UserArticle[]
+
+  @@index([userId, date])
 }

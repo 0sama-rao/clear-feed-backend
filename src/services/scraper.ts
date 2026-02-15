@@ -14,6 +14,10 @@ export interface ScrapedArticle {
   content: string;
   publishedAt: Date | null;
   sourceId: string;
+  // v2 fields
+  author?: string | null;
+  tags?: string[];
+  guid?: string | null;
 }
 
 /**
@@ -108,6 +112,9 @@ async function scrapeRSS(source: Source): Promise<ScrapedArticle[]> {
       content: stripHtml(content).slice(0, 5000), // Cap content length
       publishedAt,
       sourceId: source.id,
+      author: (item.creator as string) || (item.author as string) || null,
+      tags: (item.categories as string[]) || [],
+      guid: (item.guid as string) || null,
     });
   }
 

@@ -2,8 +2,24 @@ import type { FastifyInstance } from "fastify";
 import { hashSync, compareSync } from "bcryptjs";
 import { randomUUID } from "crypto";
 
-function formatUser(user: { id: string; email: string; name: string; role: string }) {
-  return { id: user.id, email: user.email, name: user.name, role: user.role.toLowerCase() };
+function formatUser(user: {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  onboarded: boolean;
+  industry?: { id: string; name: string; slug: string } | null;
+}) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role.toLowerCase(),
+    onboarded: user.onboarded,
+    industry: user.industry
+      ? { id: user.industry.id, name: user.industry.name, slug: user.industry.slug }
+      : null,
+  };
 }
 
 export default async function authRoutes(app: FastifyInstance) {
@@ -30,6 +46,7 @@ export default async function authRoutes(app: FastifyInstance) {
         password: hashSync(password, 10),
         name,
       },
+      include: { industry: true },
     });
 
     const tokens = await generateTokens(app, user.id, user.role);
@@ -47,7 +64,10 @@ export default async function authRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: "email and password are required" });
     }
 
-    const user = await app.prisma.user.findUnique({ where: { email } });
+    const user = await app.prisma.user.findUnique({
+      where: { email },
+      include: { industry: true },
+    });
     if (!user || !compareSync(password, user.password)) {
       return reply.status(401).send({ error: "Invalid email or password" });
     }
@@ -66,7 +86,7 @@ export default async function authRoutes(app: FastifyInstance) {
 
     const stored = await app.prisma.refreshToken.findUnique({
       where: { token: refreshToken },
-      include: { user: true },
+      include: { user: { include: { industry: true } } },
     });
 
     if (!stored || stored.expiresAt < new Date()) {

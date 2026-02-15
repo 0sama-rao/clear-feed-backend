@@ -2,17 +2,38 @@ import type { PrismaClient } from "@prisma/client";
 import { scrapeUserSources } from "../services/scraper.js";
 import { matchArticles, getUserKeywords } from "../services/matcher.js";
 import { summarizeArticle } from "../services/summarizer.js";
+import { runDigestForUserV2 } from "./dailyDigestV2.js";
 
 /**
- * Runs the full digest pipeline for a single user:
+ * Runs the digest pipeline for a single user.
+ * Dispatches to v2 pipeline for onboarded users, v1 for others.
+ */
+export async function runDigestForUser(
+  prisma: PrismaClient,
+  userId: string
+): Promise<DigestResult> {
+  // Check if user is onboarded → use v2 pipeline
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { onboarded: true, industryId: true },
+  });
+
+  if (user?.onboarded && user?.industryId) {
+    console.log(`[Digest] User ${userId}: Using v2 pipeline (onboarded)`);
+    return runDigestForUserV2(prisma, userId);
+  }
+
+  return runDigestForUserV1(prisma, userId);
+}
+
+/**
+ * V1 digest pipeline (original):
  * 1. Scrape their sources
  * 2. Match articles against their keywords
  * 3. Summarize matched articles with AI
  * 4. Store everything in the database
- *
- * Returns a summary of what happened.
  */
-export async function runDigestForUser(
+async function runDigestForUserV1(
   prisma: PrismaClient,
   userId: string
 ): Promise<DigestResult> {

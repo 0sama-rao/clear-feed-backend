@@ -9,6 +9,7 @@ import keywordsRoutes from "./routes/keywords.js";
 import feedRoutes from "./routes/feed.js";
 import adminRoutes from "./routes/admin.js";
 import digestRoutes from "./routes/digest.js";
+import onboardingRoutes from "./routes/onboarding.js";
 import { runDigestForAllUsers } from "./jobs/dailyDigest.js";
 
 export async function buildApp() {
@@ -28,6 +29,7 @@ export async function buildApp() {
   await app.register(feedRoutes);
   await app.register(adminRoutes);
   await app.register(digestRoutes);
+  await app.register(onboardingRoutes);
 
   // Daily digest cron — runs every day at 6:00 AM
   cron.schedule("0 6 * * *", async () => {
