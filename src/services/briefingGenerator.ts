@@ -24,11 +24,12 @@ export interface GroupBriefing {
   executiveSummary: string;
   impactAnalysis: string;
   actionability: string;
+  caseType: number; // 1=actively exploited, 2=vulnerable, 3=fixed, 4=not applicable
 }
 
 /**
  * Generates a structured intelligence briefing for a group of related articles.
- * Uses a single OpenAI call per group (gpt-4o for quality).
+ * Uses a single OpenAI call per group (gpt-4o-mini for speed).
  */
 export async function generateGroupBriefing(
   input: GroupBriefingInput
@@ -77,7 +78,7 @@ export async function generateGroupBriefing(
     const signalSummary = [...allSignals].join(", ");
 
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4o-mini",
       response_format: { type: "json_object" },
       messages: [
         {
@@ -94,6 +95,21 @@ Classify the story as ONE of:
 - **THREAT_INTEL**: Threat actor activity, TTPs, malware analysis, or threat landscape reports
 - **RESEARCH**: Academic research, new attack techniques, proof-of-concepts, or industry studies
 - **POLICY**: Regulatory changes, compliance updates, government actions, or legal developments
+
+## CASE TYPE CLASSIFICATION
+
+Also classify the urgency as ONE integer (caseType):
+- **1** (Actively Exploited): vulnerability/threat known to be exploited in the wild. CISA KEV listed, PoC exploits available, or confirmed active campaigns.
+- **2** (Vulnerable, No Known Exploit): vulnerability/exposure exists but no active exploitation confirmed yet. Patch available or pending.
+- **3** (Fixed): issue patched/resolved. Post-incident update or patch confirmation.
+- **4** (Not Applicable): informational — research, policy, general threat intel with no specific vulnerability lifecycle.
+
+Rules:
+- VULNERABILITY → 1, 2, or 3 based on exploitation status
+- INCIDENT → 1 if active attack, 3 if post-incident retrospective
+- THREAT_INTEL → 1 if active campaign, 4 if general analysis
+- RESEARCH → 4 unless active exploitation demonstrated (then 1)
+- POLICY → always 4
 
 ## SECTIONS
 
@@ -174,7 +190,8 @@ Return JSON:
   "synopsis": "...",
   "executiveSummary": "- bullet 1\\n- bullet 2\\n...",
   "impactAnalysis": "...",
-  "actionability": "..."
+  "actionability": "...",
+  "caseType": 4
 }`,
         },
         {
@@ -200,6 +217,11 @@ ${combined}`,
     }
 
     const parsed = JSON.parse(content) as GroupBriefing;
+
+    // Validate caseType — default to 4 (not applicable) if missing or out of range
+    if (!parsed.caseType || parsed.caseType < 1 || parsed.caseType > 4) {
+      parsed.caseType = 4;
+    }
 
     if (!parsed.title || !parsed.synopsis) {
       console.error(`[BriefingGenerator] Incomplete response for group "${input.groupTitle}"`);

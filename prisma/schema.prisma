@@ -43,6 +43,7 @@ model User {
   userArticles  UserArticle[]
   refreshTokens RefreshToken[]
   newsGroups    NewsGroup[]
+  periodReports PeriodReport[]
   industry      Industry? @relation(fields: [industryId], references: [id])
 }
 
@@ -217,6 +218,7 @@ model NewsGroup {
   executiveSummary String?  @db.Text
   impactAnalysis   String?  @db.Text
   actionability    String?  @db.Text
+  caseType         Int?     // 1=actively exploited, 2=vulnerable, 3=fixed, 4=not applicable
   confidence       Float    @default(0.0)
   date             DateTime @default(now())
   createdAt        DateTime @default(now())
@@ -225,4 +227,24 @@ model NewsGroup {
   userArticles UserArticle[]
 
   @@index([userId, date])
+}
+
+// ──────────────────────────────────────────
+// V2: Period Intelligence Reports
+// ──────────────────────────────────────────
+
+model PeriodReport {
+  id          String   @id @default(uuid())
+  userId      String
+  period      String   // "1d" | "7d" | "30d"
+  fromDate    DateTime
+  toDate      DateTime
+  summary     String?  @db.Text
+  stats       Json?
+  generatedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, period])
+  @@index([userId])
 }

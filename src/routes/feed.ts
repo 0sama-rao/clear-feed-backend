@@ -91,23 +91,44 @@ export default async function feedRoutes(app: FastifyInstance) {
   // V2: Grouped intelligence feed
   // ──────────────────────────────────────────
 
-  // GET /api/feed/brief — grouped intelligence feed
-  app.get<{ Querystring: { date?: string; page?: string; limit?: string } }>(
+  // GET /api/feed/brief — grouped intelligence feed with period filter
+  app.get<{ Querystring: { date?: string; period?: string; page?: string; limit?: string } }>(
     "/api/feed/brief",
-    async (request) => {
+    async (request, reply) => {
       const { userId } = request.user;
       const page = Math.max(1, parseInt(request.query.page || "1", 10));
       const limit = Math.min(20, Math.max(1, parseInt(request.query.limit || "10", 10)));
       const skip = (page - 1) * limit;
 
-      // Date filter — defaults to last 7 days
-      const dateFilter = request.query.date
-        ? new Date(request.query.date)
-        : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      // Period filter takes precedence over legacy 'date' param
+      const periodDays: Record<string, number> = { "1d": 1, "7d": 7, "30d": 30 };
+      let dateFilter: Date;
+
+      if (request.query.period) {
+        const days = periodDays[request.query.period];
+        if (!days) {
+          return reply.status(400).send({ error: "Invalid period. Use 1d, 7d, or 30d." });
+        }
+        dateFilter = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      } else if (request.query.date) {
+        dateFilter = new Date(request.query.date);
+      } else {
+        dateFilter = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      }
+
+      // Filter by article publishedAt (real-world date), not group createdAt
+      const whereClause = {
+        userId,
+        userArticles: {
+          some: {
+            article: { publishedAt: { gte: dateFilter } },
+          },
+        },
+      };
 
       const [groups, total] = await Promise.all([
         app.prisma.newsGroup.findMany({
-          where: { userId, date: { gte: dateFilter } },
+          where: whereClause,
           include: {
             _count: { select: { userArticles: true } },
             userArticles: {
@@ -126,13 +147,11 @@ export default async function feedRoutes(app: FastifyInstance) {
               orderBy: { article: { publishedAt: "desc" } },
             },
           },
-          orderBy: { date: "desc" },
+          orderBy: [{ caseType: "asc" }, { date: "desc" }], // Critical (1) first, then by date
           skip,
           take: limit,
         }),
-        app.prisma.newsGroup.count({
-          where: { userId, date: { gte: dateFilter } },
-        }),
+        app.prisma.newsGroup.count({ where: whereClause }),
       ]);
 
       return {
@@ -143,6 +162,7 @@ export default async function feedRoutes(app: FastifyInstance) {
           executiveSummary: g.executiveSummary,
           impactAnalysis: g.impactAnalysis,
           actionability: g.actionability,
+          caseType: g.caseType,
           confidence: g.confidence,
           date: g.date,
           articleCount: g._count.userArticles,
@@ -161,6 +181,38 @@ export default async function feedRoutes(app: FastifyInstance) {
           })),
         })),
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      };
+    }
+  );
+
+  // GET /api/feed/brief/report — cached period intelligence report
+  app.get<{ Querystring: { period?: string } }>(
+    "/api/feed/brief/report",
+    async (request, reply) => {
+      const { userId } = request.user;
+      const period = request.query.period || "7d";
+
+      if (!["1d", "7d", "30d"].includes(period)) {
+        return reply.status(400).send({ error: "Invalid period. Use 1d, 7d, or 30d." });
+      }
+
+      const report = await app.prisma.periodReport.findUnique({
+        where: { userId_period: { userId, period } },
+      });
+
+      if (!report) {
+        return reply.status(404).send({
+          error: "No report available yet. Reports are generated after each digest run.",
+        });
+      }
+
+      return {
+        period: report.period,
+        fromDate: report.fromDate,
+        toDate: report.toDate,
+        summary: report.summary,
+        stats: report.stats,
+        generatedAt: report.generatedAt,
       };
     }
   );
@@ -248,6 +300,7 @@ export default async function feedRoutes(app: FastifyInstance) {
         executiveSummary: group.executiveSummary,
         impactAnalysis: group.impactAnalysis,
         actionability: group.actionability,
+        caseType: group.caseType,
         confidence: group.confidence,
         date: group.date,
         articles: group.userArticles.map((ua) => ({

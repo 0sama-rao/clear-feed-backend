@@ -6,15 +6,15 @@ import { extractEntities } from "../services/entityExtractor.js";
 import { groupArticles, type ArticleForGrouping } from "../services/grouper.js";
 import { generateGroupBriefing } from "../services/briefingGenerator.js";
 import { generateExecutiveSummary } from "../services/executiveSummaryGenerator.js";
+import { generateAllPeriodReports } from "../services/periodReportGenerator.js";
 import type { DigestResult } from "./dailyDigest.js";
 
-const CONTENT_BATCH_SIZE = 10; // parallel content extractions
-const ENTITY_BATCH_SIZE = 5; // parallel OpenAI entity calls
-const BRIEFING_BATCH_SIZE = 5; // parallel OpenAI briefing calls
+const PROCESS_BATCH_SIZE = 15; // parallel content+entity extractions per article
+const BRIEFING_BATCH_SIZE = 10; // parallel OpenAI briefing calls
 
 /**
  * V2 digest pipeline for onboarded users.
- * Steps: scrape → match → store → extract content (parallel) → extract entities (parallel) → group → brief (parallel)
+ * Steps: scrape → match → store → extract content+entities per article (parallel) → group → brief (parallel)
  */
 export async function runDigestForUserV2(
   prisma: PrismaClient,
@@ -122,113 +122,101 @@ export async function runDigestForUserV2(
       }
     }
 
-    // ── Step 4: Extract content in parallel batches ──
-    const needsContent = await prisma.article.findMany({
+    // ── Step 4: Extract content + entities per article (parallel pipeline) ──
+    // Each article goes through: content fetch → entity extraction in one shot.
+    // Cross-user cache: skip content if cleanText exists, skip entities if entitiesExtracted.
+    const needsProcessing = await prisma.article.findMany({
       where: {
         id: { in: storedArticles.map((a) => a.articleId) },
-        cleanText: null,
+        OR: [{ cleanText: null }, { entitiesExtracted: false }],
       },
-      select: { id: true, url: true, title: true },
+      select: { id: true, url: true, title: true, cleanText: true, content: true, entitiesExtracted: true },
     });
 
-    if (needsContent.length > 0) {
-      console.log(`[DigestV2] User ${userId}: Extracting content for ${needsContent.length} articles (batches of ${CONTENT_BATCH_SIZE})...`);
-      for (let i = 0; i < needsContent.length; i += CONTENT_BATCH_SIZE) {
-        const batch = needsContent.slice(i, i + CONTENT_BATCH_SIZE);
+    if (needsProcessing.length > 0) {
+      console.log(`[DigestV2] User ${userId}: Processing ${needsProcessing.length} articles (content+entities, batches of ${PROCESS_BATCH_SIZE})...`);
+      for (let i = 0; i < needsProcessing.length; i += PROCESS_BATCH_SIZE) {
+        const batch = needsProcessing.slice(i, i + PROCESS_BATCH_SIZE);
         await Promise.allSettled(
           batch.map(async (article) => {
             try {
-              const extracted = await extractArticleContent(article.url);
-              if (extracted) {
-                await prisma.article.update({
-                  where: { id: article.id },
-                  data: {
-                    cleanText: extracted.cleanText,
-                    rawHtml: extracted.rawHtml,
-                    externalLinks: extracted.externalLinks,
-                    author: extracted.author || undefined,
-                  },
-                });
-              }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              console.error(`[DigestV2] Content extraction failed for "${article.title}": ${msg}`);
-            }
-          })
-        );
-      }
-    }
-
-    // ── Step 5: Extract entities in parallel batches ──
-    const needsEntities = await prisma.article.findMany({
-      where: {
-        id: { in: storedArticles.map((a) => a.articleId) },
-        entitiesExtracted: false,
-      },
-      select: { id: true, title: true, cleanText: true, content: true },
-    });
-
-    if (needsEntities.length > 0 && signalSlugs.length > 0) {
-      console.log(`[DigestV2] User ${userId}: Extracting entities for ${needsEntities.length} articles (batches of ${ENTITY_BATCH_SIZE})...`);
-      for (let i = 0; i < needsEntities.length; i += ENTITY_BATCH_SIZE) {
-        const batch = needsEntities.slice(i, i + ENTITY_BATCH_SIZE);
-        await Promise.allSettled(
-          batch.map(async (article) => {
-            try {
-              const text = article.cleanText || article.content;
-              const entities = await extractEntities(article.title, text, signalSlugs);
-
-              if (entities) {
-                const entityRecords = [
-                  ...entities.companies.map((e) => ({ ...e, type: "COMPANY" as const })),
-                  ...entities.people.map((e) => ({ ...e, type: "PERSON" as const })),
-                  ...entities.products.map((e) => ({ ...e, type: "PRODUCT" as const })),
-                  ...entities.geographies.map((e) => ({ ...e, type: "GEOGRAPHY" as const })),
-                  ...entities.sectors.map((e) => ({ ...e, type: "SECTOR" as const })),
-                ];
-
-                // Batch create entities
-                if (entityRecords.length > 0) {
-                  await prisma.articleEntity.createMany({
-                    data: entityRecords.map((e) => ({
-                      articleId: article.id,
-                      type: e.type,
-                      name: e.name,
-                      confidence: e.confidence,
-                    })),
-                    skipDuplicates: true,
-                  });
-                }
-
-                // Batch upsert signals
-                for (const signal of entities.signals) {
-                  const signalRecord = signalMap.get(signal.slug);
-                  if (signalRecord) {
-                    await prisma.articleSignal.upsert({
-                      where: {
-                        articleId_industrySignalId: {
-                          articleId: article.id,
-                          industrySignalId: signalRecord.id,
-                        },
-                      },
-                      update: { confidence: signal.confidence },
-                      create: {
-                        articleId: article.id,
-                        industrySignalId: signalRecord.id,
-                        confidence: signal.confidence,
+              // Phase 1: Content extraction (skip if already cached from another user)
+              let text = article.cleanText || article.content;
+              if (!article.cleanText) {
+                try {
+                  const extracted = await extractArticleContent(article.url);
+                  if (extracted) {
+                    await prisma.article.update({
+                      where: { id: article.id },
+                      data: {
+                        cleanText: extracted.cleanText,
+                        rawHtml: extracted.rawHtml,
+                        externalLinks: extracted.externalLinks,
+                        author: extracted.author || undefined,
                       },
                     });
+                    text = extracted.cleanText || text;
                   }
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  console.error(`[DigestV2] Content extraction failed for "${article.title}": ${msg}`);
                 }
+              }
 
-                await prisma.article.update({
-                  where: { id: article.id },
-                  data: { entitiesExtracted: true },
-                });
+              // Phase 2: Entity extraction (skip if already done by another user)
+              if (!article.entitiesExtracted && signalSlugs.length > 0) {
+                const entities = await extractEntities(article.title, text, signalSlugs);
+
+                if (entities) {
+                  const entityRecords = [
+                    ...entities.companies.map((e) => ({ ...e, type: "COMPANY" as const })),
+                    ...entities.people.map((e) => ({ ...e, type: "PERSON" as const })),
+                    ...entities.products.map((e) => ({ ...e, type: "PRODUCT" as const })),
+                    ...entities.geographies.map((e) => ({ ...e, type: "GEOGRAPHY" as const })),
+                    ...entities.sectors.map((e) => ({ ...e, type: "SECTOR" as const })),
+                  ];
+
+                  if (entityRecords.length > 0) {
+                    await prisma.articleEntity.createMany({
+                      data: entityRecords.map((e) => ({
+                        articleId: article.id,
+                        type: e.type,
+                        name: e.name,
+                        confidence: e.confidence,
+                      })),
+                      skipDuplicates: true,
+                    });
+                  }
+
+                  for (const signal of entities.signals) {
+                    const signalRecord = signalMap.get(signal.slug);
+                    if (signalRecord) {
+                      await prisma.articleSignal.upsert({
+                        where: {
+                          articleId_industrySignalId: {
+                            articleId: article.id,
+                            industrySignalId: signalRecord.id,
+                          },
+                        },
+                        update: { confidence: signal.confidence },
+                        create: {
+                          articleId: article.id,
+                          industrySignalId: signalRecord.id,
+                          confidence: signal.confidence,
+                        },
+                      });
+                    }
+                  }
+
+                  await prisma.article.update({
+                    where: { id: article.id },
+                    data: { entitiesExtracted: true },
+                  });
+                }
               }
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
-              console.error(`[DigestV2] Entity extraction failed for "${article.title}": ${msg}`);
+              console.error(`[DigestV2] Processing failed for "${article.title}": ${msg}`);
             }
           })
         );
@@ -364,6 +352,7 @@ async function groupAndBriefUngrouped(
               executiveSummary: briefing.executiveSummary,
               impactAnalysis: briefing.impactAnalysis,
               actionability: briefing.actionability,
+              caseType: briefing.caseType,
             },
           });
           return true;
@@ -414,6 +403,16 @@ async function groupAndBriefUngrouped(
         }))
       );
     }
+  }
+
+  // Generate period reports (1d, 7d, 30d) — cached for frontend
+  console.log(`[DigestV2] User ${userId}: Generating period reports...`);
+  try {
+    await generateAllPeriodReports(prisma, userId);
+    console.log(`[DigestV2] User ${userId}: Period reports generated.`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[DigestV2] Period report generation failed: ${msg}`);
   }
 }
 
