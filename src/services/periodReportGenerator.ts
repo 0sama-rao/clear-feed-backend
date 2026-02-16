@@ -229,14 +229,25 @@ async function generatePeriodSummary(
     period === "1d" ? "today" : period === "7d" ? "this week" : "this month";
 
   const caseLabels: Record<number, string> = {
-    1: "CRITICAL",
-    2: "VULNERABLE",
-    3: "FIXED",
-    4: "INFO",
+    1: "CRITICAL — Actively Exploited",
+    2: "VULNERABLE — No Known Exploit",
+    3: "FIXED — Patched/Resolved",
+    4: "INFO — Informational",
+  };
+
+  // Sort groups: critical first, then vulnerable, fixed, info
+  const sorted = [...groups].sort((a, b) => (a.caseType || 4) - (b.caseType || 4));
+
+  // Count by case type for the prompt context
+  const caseCounts = {
+    critical: groups.filter((g) => g.caseType === 1).length,
+    vulnerable: groups.filter((g) => g.caseType === 2).length,
+    fixed: groups.filter((g) => g.caseType === 3).length,
+    info: groups.filter((g) => g.caseType === 4 || !g.caseType).length,
   };
 
   try {
-    const groupSummaries = groups
+    const groupSummaries = sorted
       .map((g, i) => {
         const caseLabel = caseLabels[g.caseType || 4] || "INFO";
         return `${i + 1}. [${caseLabel}] ${g.title}\nSignals: ${g.signals.join(", ") || "None"}\n${g.synopsis}`;
@@ -248,30 +259,67 @@ async function generatePeriodSummary(
       messages: [
         {
           role: "system",
-          content: `You are a senior cybersecurity intelligence analyst. Given the story groups from ${periodLabel}, produce a comprehensive period intelligence summary.
+          content: `You are a senior cybersecurity intelligence analyst producing a ${periodLabel} intelligence report for security operations teams.
+
+You will receive story groups classified by severity:
+- **CRITICAL** (Case 1): Actively exploited vulnerabilities, ongoing attacks, confirmed campaigns with IOCs
+- **VULNERABLE** (Case 2): Known vulnerabilities with no confirmed exploitation yet, pending patches
+- **FIXED** (Case 3): Patched vulnerabilities, post-incident retrospectives, resolved issues
+- **INFO** (Case 4): Research, policy updates, threat landscape reports, general intelligence
+
+Period breakdown: ${caseCounts.critical} critical, ${caseCounts.vulnerable} vulnerable, ${caseCounts.fixed} fixed, ${caseCounts.info} informational (${groups.length} total stories).
 
 Structure your response as markdown with these sections:
 
 ## Key Developments
-3-5 bullet points of the most significant events. Prioritize CRITICAL stories first.
+3-5 bullet points of the most impactful events. ALWAYS lead with CRITICAL (Case 1) stories first. For each bullet:
+- Name the specific threat, CVE, or actor
+- State what happened and who is affected
+- Mark urgency: 🔴 for critical, 🟡 for vulnerable, 🟢 for fixed, ⚪ for informational
 
 ## Threat Landscape
-2-3 sentences on overall threat posture for the period.
+
+Break down ${periodLabel}'s threat posture by severity tier:
+
+**Active Threats (Immediate Action Required)**
+For CRITICAL stories: list each actively exploited vulnerability or ongoing attack. Include CVE IDs, affected products/versions, threat actors, and known IOCs from the data. If no critical stories exist, state "No actively exploited threats this period."
+
+**Exposure Risks (Monitor & Prepare)**
+For VULNERABLE stories: list unpatched vulnerabilities or emerging threats not yet exploited. Include affected software, available patches, and recommended SLAs. If none, state "No new unpatched exposures."
+
+**Resolved This Period**
+For FIXED stories: briefly note what was patched or resolved. Include patch versions. If none, state "No resolutions to report."
+
+**Intelligence & Context**
+For INFO stories: summarize research findings, policy changes, or threat landscape shifts that inform strategic posture.
 
 ## Trends
-Any patterns, escalating themes, or recurring actors/signals.
+Identify patterns across all stories:
+- Recurring threat actors, targeted sectors, or attack techniques
+- Escalating signal categories (which signals are trending up)
+- Any correlation between stories (same actor, same vulnerability class, same target sector)
+
+## Recommended Actions
+Prioritized action items based on the case types:
+1. **Immediate** (from CRITICAL stories): specific patches, IOCs to block, services to disable — cite real names and versions
+2. **This Week** (from VULNERABLE stories): patches to schedule, detection rules to deploy, monitoring to enable
+3. **Review** (from FIXED/INFO stories): validations to perform, policies to update, awareness items
 
 ## Outlook
-1-2 sentences on what to watch next.
+2-3 sentences on what to watch next based on the trends and unresolved threats. Reference specific actors, CVEs, or campaigns that may escalate.
 
-Be specific. Reference real names, CVEs, and actors from the data. Return ONLY the markdown, no preamble.`,
+IMPORTANT RULES:
+- Be specific: use real CVE IDs, product names, versions, actor names, and IOCs from the provided data
+- Do NOT fabricate information — only reference what appears in the story synopses
+- If a section has no applicable stories, include a brief "Nothing to report" note rather than omitting it
+- Return ONLY the markdown, no preamble or closing remarks`,
         },
         {
           role: "user",
           content: `Intelligence groups from ${periodLabel} (${groups.length} stories):\n\n${groupSummaries}`,
         },
       ],
-      max_tokens: 1200,
+      max_tokens: 2500,
       temperature: 0.3,
     });
 

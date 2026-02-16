@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cyberbrief-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cyberbrief
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-cyberbrief_prod_2026}
+      POSTGRES_DB: cyberbrief
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cyberbrief"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: cyberbrief-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://cyberbrief:${DB_PASSWORD:-cyberbrief_prod_2026}@postgres:5432/cyberbrief?schema=public
+      JWT_SECRET: ${JWT_SECRET}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      PORT: 3000
+      NODE_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
