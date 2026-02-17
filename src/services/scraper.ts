@@ -39,13 +39,23 @@ export async function scrapeUserSources(
   const allArticles: ScrapedArticle[] = [];
   const errors: string[] = [];
 
-  // Scrape each source, don't let one failure kill the whole batch
-  for (const source of sources) {
-    try {
-      const articles = await scrapeSource(source);
-      allArticles.push(...articles);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+  // Scrape all sources in parallel — each has its own timeout so one slow feed won't block others
+  const results = await Promise.allSettled(
+    sources.map(async (source) => {
+      try {
+        return { source, articles: await scrapeSource(source) };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw { source, message };
+      }
+    })
+  );
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      allArticles.push(...result.value.articles);
+    } else {
+      const { source, message } = result.reason as { source: Source; message: string };
       errors.push(`[${source.name}] ${message}`);
       console.error(`Scraper error for source "${source.name}" (${source.url}):`, message);
     }

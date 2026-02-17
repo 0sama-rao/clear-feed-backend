@@ -7,9 +7,15 @@ interface PeriodStats {
   totalStories: number;
   totalArticles: number;
   criticalStories: number;
+  vulnerableStories: number;
+  fixedStories: number;
+  infoStories: number;
   signalDistribution: Record<string, number>;
   topEntities: Array<{ name: string; type: string; count: number }>;
   storiesPerDay: Record<string, number>;
+  topAffectedProducts: Array<{ name: string; count: number }>;
+  topAffectedSectors: Array<{ name: string; count: number }>;
+  topThreatActors: Array<{ name: string; count: number }>;
 }
 
 const PERIOD_DAYS: Record<string, number> = {
@@ -75,22 +81,33 @@ export async function generatePeriodReport(
   // Compute stats from DB data (no AI)
   const stats = computeStats(groups, fromDate, toDate);
 
-  // Generate AI summary (one gpt-4o-mini call)
-  const summary = await generatePeriodSummary(
-    groups.map((g) => ({
-      title: g.title,
-      synopsis: g.synopsis || "",
-      caseType: g.caseType,
-      signals: [
-        ...new Set(
-          g.userArticles.flatMap((ua) =>
-            ua.article.articleSignals.map((as) => as.industrySignal.name)
-          )
-        ),
-      ],
-    })),
-    period
-  );
+  // Build group data for AI prompt
+  const groupData = groups.map((g) => ({
+    title: g.title,
+    synopsis: g.synopsis || "",
+    executiveSummary: g.executiveSummary || "",
+    impactAnalysis: g.impactAnalysis || "",
+    actionability: g.actionability || "",
+    caseType: g.caseType,
+    articleCount: g.userArticles.length,
+    signals: [
+      ...new Set(
+        g.userArticles.flatMap((ua) =>
+          ua.article.articleSignals.map((as) => as.industrySignal.name)
+        )
+      ),
+    ],
+    entities: [
+      ...new Set(
+        g.userArticles.flatMap((ua) =>
+          ua.article.entities.map((e) => `${e.type}: ${e.name}`)
+        )
+      ),
+    ].slice(0, 15),
+  }));
+
+  // Generate AI summary with period-specific prompt
+  const summary = await generatePeriodSummary(groupData, period, stats);
 
   // Upsert into DB
   await prisma.periodReport.upsert({
@@ -134,11 +151,7 @@ function computeStats(
   fromDate: Date,
   toDate: Date
 ): PeriodStats {
-  // Total stories
   const totalStories = groups.length;
-
-  // Total unique articles
-  const articleIds = new Set<string>();
   const signalCounts = new Map<string, number>();
   const entityCounts = new Map<string, { type: string; count: number }>();
   const dailyCounts = new Map<string, number>();
@@ -151,20 +164,15 @@ function computeStats(
   }
 
   for (const group of groups) {
-    // Stories per day
     const dayKey = group.date.toISOString().split("T")[0];
     dailyCounts.set(dayKey, (dailyCounts.get(dayKey) || 0) + 1);
 
     for (const ua of group.userArticles) {
-      articleIds.add(ua.article.toString()); // count unique articles
-
-      // Signal distribution
       for (const as of ua.article.articleSignals) {
         const name = as.industrySignal.name;
         signalCounts.set(name, (signalCounts.get(name) || 0) + 1);
       }
 
-      // Entity counts
       for (const e of ua.article.entities) {
         const key = `${e.type}::${e.name}`;
         const existing = entityCounts.get(key);
@@ -177,22 +185,35 @@ function computeStats(
     }
   }
 
-  // Critical stories (caseType === 1)
+  // Case type counts
   const criticalStories = groups.filter((g) => g.caseType === 1).length;
+  const vulnerableStories = groups.filter((g) => g.caseType === 2).length;
+  const fixedStories = groups.filter((g) => g.caseType === 3).length;
+  const infoStories = groups.filter((g) => g.caseType === 4 || !g.caseType).length;
 
-  // Signal distribution as object
+  // Signal distribution
   const signalDistribution: Record<string, number> = {};
   for (const [name, count] of [...signalCounts.entries()].sort((a, b) => b[1] - a[1])) {
     signalDistribution[name] = count;
   }
 
-  // Top 10 entities
-  const topEntities = [...entityCounts.entries()]
+  // Top entities by type
+  const allEntities = [...entityCounts.entries()]
     .map(([key, val]) => {
       const [type, name] = key.split("::");
       return { name, type, count: val.count };
     })
-    .sort((a, b) => b.count - a.count)
+    .sort((a, b) => b.count - a.count);
+
+  const topEntities = allEntities.slice(0, 10);
+  const topAffectedProducts = allEntities
+    .filter((e) => e.type === "PRODUCT")
+    .slice(0, 10);
+  const topAffectedSectors = allEntities
+    .filter((e) => e.type === "SECTOR")
+    .slice(0, 10);
+  const topThreatActors = allEntities
+    .filter((e) => e.type === "PERSON" || e.type === "COMPANY")
     .slice(0, 10);
 
   // Stories per day
@@ -205,121 +226,398 @@ function computeStats(
     totalStories,
     totalArticles: groups.reduce((sum, g) => sum + g.userArticles.length, 0),
     criticalStories,
+    vulnerableStories,
+    fixedStories,
+    infoStories,
     signalDistribution,
     topEntities,
     storiesPerDay,
+    topAffectedProducts,
+    topAffectedSectors,
+    topThreatActors,
   };
 }
 
+// ── Period-specific prompt builders ──
+
+interface GroupInput {
+  title: string;
+  synopsis: string;
+  executiveSummary: string;
+  impactAnalysis: string;
+  actionability: string;
+  caseType: number | null;
+  articleCount: number;
+  signals: string[];
+  entities: string[];
+}
+
+const CASE_LABELS: Record<number, string> = {
+  1: "CRITICAL — Actively Exploited",
+  2: "VULNERABLE — No Known Exploit",
+  3: "FIXED — Patched/Resolved",
+  4: "INFO — Informational",
+};
+
+function buildGroupContext(groups: GroupInput[]): string {
+  const sorted = [...groups].sort((a, b) => (a.caseType || 4) - (b.caseType || 4));
+
+  const groupSummaries = sorted
+    .map((g, i) => {
+      const caseLabel = CASE_LABELS[g.caseType || 4] || "INFO";
+      const parts = [
+        `--- Story ${i + 1} [${caseLabel}] (${g.articleCount} articles) ---`,
+        `Title: ${g.title}`,
+        `Signals: ${g.signals.join(", ") || "None"}`,
+        `Entities: ${g.entities.join(", ") || "None"}`,
+        `\nSynopsis:\n${g.synopsis}`,
+      ];
+      if (g.executiveSummary) parts.push(`\nKey Facts:\n${g.executiveSummary}`);
+      if (g.impactAnalysis) parts.push(`\nImpact Analysis:\n${g.impactAnalysis}`);
+      if (g.actionability) parts.push(`\nRecommended Actions:\n${g.actionability}`);
+      return parts.join("\n");
+    })
+    .join("\n\n");
+
+  return groupSummaries.length > 30_000
+    ? groupSummaries.slice(0, 30_000) + "\n\n[... truncated for length]"
+    : groupSummaries;
+}
+
+function buildDailyPrompt(groups: GroupInput[], stats: PeriodStats): string {
+  const allSignals = [...new Set(groups.flatMap((g) => g.signals))].join(", ");
+
+  return `You are a senior cybersecurity intelligence analyst producing a DAILY OPERATIONAL BRIEFING for SOC analysts, vulnerability management, and infrastructure operations teams.
+
+Audience: Security Operations Center, Vulnerability Management, Infrastructure Ops
+Focus: What needs immediate attention TODAY
+
+You will receive full briefings for each story group. Use ALL data to produce a focused, action-oriented daily summary.
+
+## INPUT DATA CONTEXT
+- ${stats.totalStories} stories today (${stats.totalArticles} articles)
+- Severity breakdown: ${stats.criticalStories} critical, ${stats.vulnerableStories} vulnerable, ${stats.fixedStories} fixed, ${stats.infoStories} informational
+- Active signals: ${allSignals || "None"}
+- Top affected products: ${stats.topAffectedProducts.map((p) => p.name).join(", ") || "None identified"}
+- Top affected sectors: ${stats.topAffectedSectors.map((s) => s.name).join(", ") || "None identified"}
+
+## OUTPUT STRUCTURE (return markdown)
+
+### Executive Snapshot
+
+A 3-5 line summary paragraph covering: How many new stories, what's critical, what needs action NOW. Lead with the most urgent item.
+
+### Critical Alerts
+
+For each CRITICAL (Case 1) story:
+- 🔴 **[Title]** — What happened, CVE IDs if available, affected products/versions, who is at risk
+- **Immediate Action:** Exact steps (patch to version X, block IOC Y, disable service Z)
+
+If no critical stories: "No actively exploited threats detected today."
+
+### New Vulnerabilities
+
+For each VULNERABLE (Case 2) story:
+- 🟡 **[Title]** — CVE ID, affected software/versions, exploitation complexity, patch availability
+- **Action:** Schedule patch, add detection rule, monitor for exploitation
+
+If none: "No new unpatched vulnerabilities today."
+
+### Resolved / Patched
+
+For each FIXED (Case 3) story:
+- 🟢 **[Title]** — What was fixed, which version resolves it
+- **Action:** Validate patch deployment, close tickets
+
+If none: "No resolutions to report."
+
+### Intelligence Notes
+
+For INFO (Case 4) stories — 1-2 lines each:
+- ⚪ **[Title]** — Key takeaway and relevance
+
+### Today's Action Checklist
+
+A numbered list of SPECIFIC actions, ordered by urgency:
+1. [URGENT] Patch X to version Y (CVE-XXXX-XXXXX)
+2. [URGENT] Block IOC: ...
+3. [HIGH] Schedule patching for ...
+4. [MEDIUM] Review ...
+5. [LOW] Awareness: ...
+
+CRITICAL RULES:
+- Use REAL CVE IDs, product names, versions, and IOCs from the briefing data
+- Do NOT fabricate or hallucinate — only reference what appears in the story data
+- This is an OPERATIONAL daily brief — be specific, concise, actionable
+- No filler text or generic advice. Every line should reference real data
+- Return ONLY the markdown, no preamble or closing remarks`;
+}
+
+function buildWeeklyPrompt(groups: GroupInput[], stats: PeriodStats): string {
+  const allSignals = [...new Set(groups.flatMap((g) => g.signals))].join(", ");
+  const signalBreakdown = Object.entries(stats.signalDistribution)
+    .slice(0, 8)
+    .map(([name, count]) => `${name}: ${count}`)
+    .join(", ");
+
+  return `You are a senior cybersecurity intelligence analyst producing a WEEKLY TACTICAL INTELLIGENCE REPORT for security leadership and IT managers.
+
+Audience: CISO, Security Leadership, IT Managers
+Focus: Trends, threat posture shifts, and tactical priorities for the week
+
+You will receive full briefings for each story group this week. Synthesize them into a tactical trend analysis.
+
+## INPUT DATA CONTEXT
+- ${stats.totalStories} stories this week (${stats.totalArticles} articles)
+- Severity: ${stats.criticalStories} critical, ${stats.vulnerableStories} vulnerable, ${stats.fixedStories} fixed, ${stats.infoStories} informational
+- Signal distribution: ${signalBreakdown || "None"}
+- Active signals: ${allSignals || "None"}
+- Top products mentioned: ${stats.topAffectedProducts.map((p) => `${p.name} (${p.count})`).join(", ") || "None"}
+- Top sectors affected: ${stats.topAffectedSectors.map((s) => `${s.name} (${s.count})`).join(", ") || "None"}
+
+## OUTPUT STRUCTURE (return markdown)
+
+### Weekly Risk Overview
+
+| Metric | Value |
+|---|---|
+| Total Stories | ${stats.totalStories} |
+| Critical (Actively Exploited) | ${stats.criticalStories} |
+| Vulnerable (Unpatched) | ${stats.vulnerableStories} |
+| Fixed / Resolved | ${stats.fixedStories} |
+| Informational | ${stats.infoStories} |
+| Total Articles Analyzed | ${stats.totalArticles} |
+
+### Key Developments This Week
+
+3-5 bullet points of the most significant events, ordered by severity:
+- 🔴/🟡/🟢/⚪ **[Title]** — What happened, who is affected, why it matters this week
+- Include CVE IDs, affected products/versions where available
+
+### Exposure Summary
+
+**Active Threats (Immediate Action Required)**
+For CRITICAL stories: name the threat, CVEs, affected products, versions, attack vectors, IOCs. What must be done NOW.
+
+**Open Exposures (Monitor & Prepare)**
+For VULNERABLE stories: what's exposed, patch status, exploitation likelihood. What to schedule this week.
+
+**Resolved This Week**
+For FIXED stories: what was patched, validation steps needed.
+
+### Thematic Trends
+
+Analyze patterns across ALL stories this week. Identify 2-4 themes, for example:
+- "Edge Infrastructure Targeting Increasing" — X VPN-related stories, Y exploited within 48h
+- "Ransomware Activity Shifting to [Sector]" — pattern across incidents
+- "Supply Chain Risks in [Technology]" — recurring dependency issues
+
+For each theme: cite the specific stories and data points that support it.
+
+### Risk Area Assessment
+
+Based on the stories this week, assess risk posture changes:
+
+| Risk Area | Trend | Notes |
+|---|---|---|
+| Perimeter / Edge Devices | ↑ / ↓ / Stable | Brief explanation |
+| Identity & Access | ↑ / ↓ / Stable | Brief explanation |
+| Cloud Infrastructure | ↑ / ↓ / Stable | Brief explanation |
+| Application / Libraries | ↑ / ↓ / Stable | Brief explanation |
+| Supply Chain | ↑ / ↓ / Stable | Brief explanation |
+
+Only include risk areas that are relevant to this week's data. Use ↑ for increased risk, ↓ for decreased, Stable if unchanged.
+
+### Recommended Actions
+
+Prioritized action items synthesized from all stories:
+
+**Immediate (24-48h)**
+- Specific patches, IOC blocks, service restrictions from CRITICAL stories
+
+**This Week**
+- Patches to schedule, detection rules to deploy, configurations to review from VULNERABLE stories
+
+**Review & Awareness**
+- Post-patch validations, policy reviews, team briefing items from FIXED/INFO stories
+
+### Weekly Outlook
+
+3-4 sentences: What to watch next week. Reference unresolved threats, actors likely to continue, areas needing monitoring.
+
+CRITICAL RULES:
+- Use REAL CVE IDs, product names, versions, actor names from the briefing data
+- Do NOT fabricate — only reference what appears in the story data
+- This is a TACTICAL weekly report — focus on trends and posture shifts, not just listing stories
+- The trends and risk assessment sections are the most important — they show PATTERNS not just events
+- Return ONLY the markdown, no preamble or closing remarks`;
+}
+
+function buildMonthlyPrompt(groups: GroupInput[], stats: PeriodStats): string {
+  const allSignals = [...new Set(groups.flatMap((g) => g.signals))].join(", ");
+  const signalBreakdown = Object.entries(stats.signalDistribution)
+    .slice(0, 10)
+    .map(([name, count]) => `${name}: ${count}`)
+    .join(", ");
+
+  return `You are a senior cybersecurity intelligence analyst producing a MONTHLY STRATEGIC INTELLIGENCE REPORT for CISO, CIO, and board-level stakeholders.
+
+Audience: CISO, CIO, Board of Directors, Executive Leadership
+Focus: Structural risk posture, systemic trends, and strategic investment guidance
+
+You will receive full briefings for all story groups this month. Produce a strategic-level report — NO raw CVE lists, NO technical noise. Only systemic trends and investment guidance.
+
+## INPUT DATA CONTEXT
+- ${stats.totalStories} stories this month (${stats.totalArticles} articles)
+- Severity: ${stats.criticalStories} critical, ${stats.vulnerableStories} vulnerable, ${stats.fixedStories} fixed, ${stats.infoStories} informational
+- Signal distribution: ${signalBreakdown || "None"}
+- Top products mentioned: ${stats.topAffectedProducts.map((p) => `${p.name} (${p.count})`).join(", ") || "None"}
+- Top sectors affected: ${stats.topAffectedSectors.map((s) => `${s.name} (${s.count})`).join(", ") || "None"}
+- Top entities: ${stats.topEntities.map((e) => `${e.name} (${e.type}, ${e.count})`).join(", ") || "None"}
+
+## OUTPUT STRUCTURE (return markdown)
+
+### Monthly Risk Posture Snapshot
+
+| Metric | Value |
+|---|---|
+| Total Stories Tracked | ${stats.totalStories} |
+| Total Articles Analyzed | ${stats.totalArticles} |
+| Critical (Actively Exploited) | ${stats.criticalStories} |
+| Vulnerable (Unpatched Exposure) | ${stats.vulnerableStories} |
+| Fixed / Resolved | ${stats.fixedStories} |
+| Informational / Research | ${stats.infoStories} |
+
+### Executive Summary
+
+A 4-6 sentence strategic overview for executives. Cover:
+- The overall threat landscape trajectory this month (escalating, stable, or improving)
+- The most significant risks that emerged
+- Key areas where organizational exposure increased or decreased
+- One sentence on recommended strategic focus
+
+### Structural Risk Observations
+
+Identify 3-5 systemic risk patterns observed across the month's data. For each:
+
+**[Observation Title]** (e.g., "Perimeter Infrastructure Remains Highest Risk Surface")
+- What percentage of critical exposure ties to this area
+- How exploitation speed or frequency is changing
+- Which specific threats drive this observation (reference real stories)
+- Business impact if unaddressed
+
+These should be STRUCTURAL observations, not event summaries. Think about what the data reveals about the organization's risk posture.
+
+### Exposure by Technology Layer
+
+Based on the month's data, assess each layer:
+
+| Layer | Exposure Level | Trend | Key Driver |
+|---|---|---|---|
+| Edge / Perimeter Devices | High / Moderate / Low | ↑ / ↓ / Stable | Brief reason |
+| Cloud Workloads | High / Moderate / Low | ↑ / ↓ / Stable | Brief reason |
+| Identity & Access Systems | High / Moderate / Low | ↑ / ↓ / Stable | Brief reason |
+| Internal Applications | High / Moderate / Low | ↑ / ↓ / Stable | Brief reason |
+| Supply Chain / Third-Party | High / Moderate / Low | ↑ / ↓ / Stable | Brief reason |
+
+Only include layers relevant to the data. Assess based on volume of stories, severity of incidents, and exploitation patterns.
+
+### Threat Activity Summary
+
+**Most Active Threat Categories This Month**
+Rank the signal categories by activity: ${allSignals || "N/A"}
+- Which increased vs last period
+- Which threat types dominated
+
+**Notable Threat Actors & Campaigns**
+Summarize any recurring threat actors, nation-state activity, or organized campaigns observed across stories.
+
+**Most Targeted Products & Sectors**
+Which products and sectors appeared most frequently in vulnerability and incident reports.
+
+### Month-over-Month Trend Analysis
+
+Identify 3-4 key trends with supporting evidence from the stories:
+- Are attacks becoming more sophisticated, faster, or more targeted?
+- Which vulnerability classes are most prevalent?
+- Are defenses improving (more fixes) or deteriorating (more critical exposures)?
+- Emerging threat vectors or techniques
+
+### Strategic Recommendations
+
+Long-term investment and capability recommendations — NOT tactical patches:
+
+1. **[Priority Area]** — What to invest in and why (e.g., "Invest in automated edge-device patch orchestration — 60% of critical exposure tied to perimeter devices")
+2. **[Priority Area]** — Strategic shift recommendation (e.g., "Reduce VPN surface exposure via zero-trust architecture")
+3. **[Priority Area]** — Capability gap to close (e.g., "Improve SBOM coverage for real-time dependency vulnerability detection")
+4. **[Priority Area]** — Process improvement (e.g., "Implement KEV-triggered auto-escalation workflow")
+
+Each recommendation should tie directly to patterns observed in the month's data.
+
+### Outlook
+
+4-5 sentences on what to expect next month. Reference:
+- Unresolved structural risks
+- Threat actors or campaigns likely to continue
+- Technology areas requiring sustained attention
+- Regulatory or compliance deadlines approaching
+
+CRITICAL RULES:
+- This is a BOARD-LEVEL report — NO raw CVE lists, NO technical implementation details
+- Focus on SYSTEMIC TRENDS and INVESTMENT GUIDANCE
+- Only reference real data from the provided stories — do NOT fabricate
+- Every observation must be supported by evidence from the story data
+- The tone should be executive: clear, decisive, forward-looking
+- Return ONLY the markdown, no preamble or closing remarks`;
+}
+
 /**
- * Generates an AI summary for the period. One gpt-4o-mini call.
+ * Generates an AI summary for the period using period-specific prompts.
  */
 async function generatePeriodSummary(
-  groups: Array<{
-    title: string;
-    synopsis: string;
-    caseType: number | null;
-    signals: string[];
-  }>,
-  period: string
+  groups: GroupInput[],
+  period: string,
+  stats: PeriodStats
 ): Promise<string | null> {
   if (!process.env.OPENAI_API_KEY || groups.length === 0) return null;
 
   const periodLabel =
     period === "1d" ? "today" : period === "7d" ? "this week" : "this month";
 
-  const caseLabels: Record<number, string> = {
-    1: "CRITICAL — Actively Exploited",
-    2: "VULNERABLE — No Known Exploit",
-    3: "FIXED — Patched/Resolved",
-    4: "INFO — Informational",
-  };
+  // Select period-specific prompt
+  let systemPrompt: string;
+  let maxTokens: number;
 
-  // Sort groups: critical first, then vulnerable, fixed, info
-  const sorted = [...groups].sort((a, b) => (a.caseType || 4) - (b.caseType || 4));
+  switch (period) {
+    case "1d":
+      systemPrompt = buildDailyPrompt(groups, stats);
+      maxTokens = 2500;
+      break;
+    case "7d":
+      systemPrompt = buildWeeklyPrompt(groups, stats);
+      maxTokens = 3500;
+      break;
+    case "30d":
+      systemPrompt = buildMonthlyPrompt(groups, stats);
+      maxTokens = 4000;
+      break;
+    default:
+      return null;
+  }
 
-  // Count by case type for the prompt context
-  const caseCounts = {
-    critical: groups.filter((g) => g.caseType === 1).length,
-    vulnerable: groups.filter((g) => g.caseType === 2).length,
-    fixed: groups.filter((g) => g.caseType === 3).length,
-    info: groups.filter((g) => g.caseType === 4 || !g.caseType).length,
-  };
+  const truncated = buildGroupContext(groups);
 
   try {
-    const groupSummaries = sorted
-      .map((g, i) => {
-        const caseLabel = caseLabels[g.caseType || 4] || "INFO";
-        return `${i + 1}. [${caseLabel}] ${g.title}\nSignals: ${g.signals.join(", ") || "None"}\n${g.synopsis}`;
-      })
-      .join("\n\n");
-
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content: `You are a senior cybersecurity intelligence analyst producing a ${periodLabel} intelligence report for security operations teams.
-
-You will receive story groups classified by severity:
-- **CRITICAL** (Case 1): Actively exploited vulnerabilities, ongoing attacks, confirmed campaigns with IOCs
-- **VULNERABLE** (Case 2): Known vulnerabilities with no confirmed exploitation yet, pending patches
-- **FIXED** (Case 3): Patched vulnerabilities, post-incident retrospectives, resolved issues
-- **INFO** (Case 4): Research, policy updates, threat landscape reports, general intelligence
-
-Period breakdown: ${caseCounts.critical} critical, ${caseCounts.vulnerable} vulnerable, ${caseCounts.fixed} fixed, ${caseCounts.info} informational (${groups.length} total stories).
-
-Structure your response as markdown with these sections:
-
-## Key Developments
-3-5 bullet points of the most impactful events. ALWAYS lead with CRITICAL (Case 1) stories first. For each bullet:
-- Name the specific threat, CVE, or actor
-- State what happened and who is affected
-- Mark urgency: 🔴 for critical, 🟡 for vulnerable, 🟢 for fixed, ⚪ for informational
-
-## Threat Landscape
-
-Break down ${periodLabel}'s threat posture by severity tier:
-
-**Active Threats (Immediate Action Required)**
-For CRITICAL stories: list each actively exploited vulnerability or ongoing attack. Include CVE IDs, affected products/versions, threat actors, and known IOCs from the data. If no critical stories exist, state "No actively exploited threats this period."
-
-**Exposure Risks (Monitor & Prepare)**
-For VULNERABLE stories: list unpatched vulnerabilities or emerging threats not yet exploited. Include affected software, available patches, and recommended SLAs. If none, state "No new unpatched exposures."
-
-**Resolved This Period**
-For FIXED stories: briefly note what was patched or resolved. Include patch versions. If none, state "No resolutions to report."
-
-**Intelligence & Context**
-For INFO stories: summarize research findings, policy changes, or threat landscape shifts that inform strategic posture.
-
-## Trends
-Identify patterns across all stories:
-- Recurring threat actors, targeted sectors, or attack techniques
-- Escalating signal categories (which signals are trending up)
-- Any correlation between stories (same actor, same vulnerability class, same target sector)
-
-## Recommended Actions
-Prioritized action items based on the case types:
-1. **Immediate** (from CRITICAL stories): specific patches, IOCs to block, services to disable — cite real names and versions
-2. **This Week** (from VULNERABLE stories): patches to schedule, detection rules to deploy, monitoring to enable
-3. **Review** (from FIXED/INFO stories): validations to perform, policies to update, awareness items
-
-## Outlook
-2-3 sentences on what to watch next based on the trends and unresolved threats. Reference specific actors, CVEs, or campaigns that may escalate.
-
-IMPORTANT RULES:
-- Be specific: use real CVE IDs, product names, versions, actor names, and IOCs from the provided data
-- Do NOT fabricate information — only reference what appears in the story synopses
-- If a section has no applicable stories, include a brief "Nothing to report" note rather than omitting it
-- Return ONLY the markdown, no preamble or closing remarks`,
-        },
+        { role: "system", content: systemPrompt },
         {
           role: "user",
-          content: `Intelligence groups from ${periodLabel} (${groups.length} stories):\n\n${groupSummaries}`,
+          content: `Full intelligence briefings from ${periodLabel} (${groups.length} stories):\n\n${truncated}`,
         },
       ],
-      max_tokens: 2500,
+      max_tokens: maxTokens,
       temperature: 0.3,
     });
 
