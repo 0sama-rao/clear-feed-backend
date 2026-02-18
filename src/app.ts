@@ -10,7 +10,8 @@ import feedRoutes from "./routes/feed.js";
 import adminRoutes from "./routes/admin.js";
 import digestRoutes from "./routes/digest.js";
 import onboardingRoutes from "./routes/onboarding.js";
-import { runDigestForAllUsers } from "./jobs/dailyDigest.js";
+import settingsRoutes from "./routes/settings.js";
+import { runScheduledDigests } from "./jobs/scheduledDigest.js";
 
 export async function buildApp() {
   const app = Fastify({ logger: true });
@@ -30,15 +31,16 @@ export async function buildApp() {
   await app.register(adminRoutes);
   await app.register(digestRoutes);
   await app.register(onboardingRoutes);
+  await app.register(settingsRoutes);
 
-  // Daily digest cron — runs every day at 6:00 AM
-  cron.schedule("0 6 * * *", async () => {
-    app.log.info("Cron: Starting daily digest for all users...");
+  // Hourly scheduler — checks which users are due for their digest
+  cron.schedule("0 * * * *", async () => {
+    app.log.info("Cron: Running scheduled digest check...");
     try {
-      await runDigestForAllUsers(app.prisma);
-      app.log.info("Cron: Daily digest completed.");
+      await runScheduledDigests(app.prisma);
+      app.log.info("Cron: Scheduled digest check completed.");
     } catch (err) {
-      app.log.error(err, "Cron: Daily digest failed.");
+      app.log.error(err, "Cron: Scheduled digest check failed.");
     }
   });
 

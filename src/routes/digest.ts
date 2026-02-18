@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { runDigestForUser, runDigestForAllUsers } from "../jobs/dailyDigest.js";
+import { sendDigestEmail } from "../services/emailService.js";
 
 export default async function digestRoutes(app: FastifyInstance) {
   // Accept any content type on digest routes (no body needed)
@@ -15,6 +16,18 @@ export default async function digestRoutes(app: FastifyInstance) {
       app.log.info(`Manual digest triggered for user ${userId}`);
 
       const result = await runDigestForUser(app.prisma, userId);
+
+      // Reset schedule timer so user doesn't get a duplicate scheduled digest
+      const user = await app.prisma.user.update({
+        where: { id: userId },
+        data: { lastDigestAt: new Date() },
+        select: { email: true, name: true, emailEnabled: true },
+      });
+
+      // Send email if enabled and there are new matched articles
+      if (user.emailEnabled && result.matched > 0) {
+        await sendDigestEmail(app.prisma, userId, user.email, user.name, result);
+      }
 
       return reply.send({
         message: "Digest completed",

@@ -26,6 +26,7 @@
     "fastify-plugin": "^5.1.0",
     "node-cron": "^4.2.1",
     "openai": "^6.21.0",
+    "resend": "^6.9.2",
     "rss-parser": "^3.13.0"
   },
   "devDependencies": {

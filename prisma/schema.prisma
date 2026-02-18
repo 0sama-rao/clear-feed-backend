@@ -38,6 +38,11 @@ model User {
   industryId String?
   onboarded  Boolean  @default(false)
 
+  // v3: scheduling & email
+  digestFrequency String    @default("1d")   // "1h"|"3h"|"6h"|"12h"|"1d"|"3d"|"7d"
+  lastDigestAt    DateTime?
+  emailEnabled    Boolean   @default(false)
+
   sources       Source[]
   keywords      Keyword[]
   userArticles  UserArticle[]

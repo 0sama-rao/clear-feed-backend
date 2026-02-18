@@ -5,7 +5,7 @@ import { extractArticleContent } from "../services/extractor.js";
 import { extractEntitiesBatch } from "../services/entityExtractor.js";
 import { groupArticles, type ArticleForGrouping } from "../services/grouper.js";
 import { generateGroupBriefing } from "../services/briefingGenerator.js";
-import { generatePeriodReport } from "../services/periodReportGenerator.js";
+import { generatePeriodReport, generateAllPeriodReports } from "../services/periodReportGenerator.js";
 import type { DigestResult } from "./dailyDigest.js";
 
 const CONTENT_BATCH_SIZE = 15; // parallel content extractions (HTTP fetches)
@@ -281,6 +281,8 @@ async function groupAndBriefUngrouped(
 
   if (ungrouped.length === 0) {
     console.log(`[DigestV2] User ${userId}: No ungrouped articles to cluster.`);
+    // Still generate period reports — they aggregate ALL existing groups, not just new ones
+    await generateAllPeriodReports(prisma, userId);
     return;
   }
 
