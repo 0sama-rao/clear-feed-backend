@@ -8,6 +8,14 @@ const rssParser = new RSSParser({
   },
 });
 
+// ── In-memory feed cache: avoid re-fetching the same RSS URL within 1 hour ──
+interface CachedFeed {
+  articles: ScrapedArticle[];
+  timestamp: number;
+}
+const feedCache = new Map<string, CachedFeed>();
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
 export interface ScrapedArticle {
   title: string;
   url: string;
@@ -97,8 +105,18 @@ async function scrapeSource(source: Source): Promise<ScrapedArticle[]> {
  * Parses an RSS feed and extracts articles from the last 24 hours.
  */
 async function scrapeRSS(source: Source): Promise<ScrapedArticle[]> {
+  const now = Date.now();
+  const cached = feedCache.get(source.url);
+
+  // Return cached articles (re-tagged with this source's ID)
+  if (cached && now - cached.timestamp < CACHE_TTL) {
+    console.log(`[Cache HIT] ${source.url}`);
+    return cached.articles.map((a) => ({ ...a, sourceId: source.id }));
+  }
+
+  console.log(`[Cache MISS] ${source.url}`);
   const feed = await rssParser.parseURL(source.url);
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
 
   const articles: ScrapedArticle[] = [];
 
@@ -128,6 +146,8 @@ async function scrapeRSS(source: Source): Promise<ScrapedArticle[]> {
     });
   }
 
+  // Store in cache for other users with the same source URL
+  feedCache.set(source.url, { articles, timestamp: now });
   return articles;
 }
 
@@ -158,6 +178,48 @@ async function scrapeWebsite(source: Source): Promise<ScrapedArticle[]> {
       sourceId: source.id,
     },
   ];
+}
+
+/**
+ * Pre-warms the feed cache by scraping all unique RSS sources for a batch of users.
+ * Call before running per-user digests so all subsequent scrapeUserSources() calls hit cache.
+ */
+export async function prewarmFeedCache(
+  prisma: PrismaClient,
+  userIds: string[]
+): Promise<void> {
+  const sources = await prisma.source.findMany({
+    where: { userId: { in: userIds }, active: true, type: "RSS" },
+    select: { url: true, id: true },
+  });
+
+  // Dedupe by URL — different users may have Source records with the same URL
+  const seen = new Set<string>();
+  const uniqueSources = sources.filter((s) => {
+    if (seen.has(s.url)) return false;
+    seen.add(s.url);
+    return true;
+  });
+
+  console.log(
+    `[Pre-warm] Scraping ${uniqueSources.length} unique RSS feeds for ${userIds.length} users...`
+  );
+
+  const results = await Promise.allSettled(
+    uniqueSources.map(async (source) => {
+      try {
+        await scrapeRSS(source as Source);
+      } catch (err) {
+        console.error(
+          `[Pre-warm] Failed ${source.url}:`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    })
+  );
+
+  const succeeded = results.filter((r) => r.status === "fulfilled").length;
+  console.log(`[Pre-warm] Cache ready — ${succeeded}/${uniqueSources.length} feeds cached.`);
 }
 
 /**

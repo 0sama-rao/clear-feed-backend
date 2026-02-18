@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import { runDigestForUser } from "./dailyDigest.js";
 import { sendDigestEmail } from "../services/emailService.js";
+import { prewarmFeedCache } from "../services/scraper.js";
 
 /** Map frequency strings to milliseconds */
 const FREQUENCY_MS: Record<string, number> = {
@@ -54,6 +55,11 @@ export async function runScheduledDigests(prisma: PrismaClient): Promise<void> {
   });
 
   console.log(`[Scheduler] ${dueUsers.length} user(s) due for digest.`);
+
+  // Pre-warm feed cache: scrape each unique RSS URL once for all due users
+  if (dueUsers.length > 0) {
+    await prewarmFeedCache(prisma, dueUsers.map((u) => u.id));
+  }
 
   for (const user of dueUsers) {
     console.log(`[Scheduler] Running digest for ${user.email} (frequency: ${user.digestFrequency})`);
