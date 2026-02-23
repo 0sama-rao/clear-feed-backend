@@ -6,6 +6,7 @@ import { extractEntitiesBatch } from "../services/entityExtractor.js";
 import { groupArticles, type ArticleForGrouping } from "../services/grouper.js";
 import { generateGroupBriefing } from "../services/briefingGenerator.js";
 import { generatePeriodReport, generateAllPeriodReports } from "../services/periodReportGenerator.js";
+import { enrichArticleCVEs } from "../services/cveExtractor.js";
 import type { DigestResult } from "./dailyDigest.js";
 
 const CONTENT_BATCH_SIZE = 15; // parallel content extractions (HTTP fetches)
@@ -239,6 +240,52 @@ export async function runDigestForUserV2(
       }
     }
 
+    // ── Step 5: Extract and enrich CVEs ──
+    const needsCVEs = await prisma.article.findMany({
+      where: {
+        id: { in: storedArticles.map((a) => a.articleId) },
+        cvesExtracted: false,
+      },
+      select: { id: true, title: true, cleanText: true, content: true },
+    });
+
+    if (needsCVEs.length > 0) {
+      console.log(`[DigestV2] User ${userId}: Extracting CVEs for ${needsCVEs.length} articles...`);
+
+      const cveMap = await enrichArticleCVEs(prisma, needsCVEs);
+
+      for (const article of needsCVEs) {
+        const cves = cveMap.get(article.id);
+        try {
+          if (cves && cves.length > 0) {
+            await prisma.articleCVE.createMany({
+              data: cves.map((cve) => ({
+                articleId: article.id,
+                cveId: cve.cveId,
+                cvssScore: cve.cvssScore,
+                severity: cve.severity,
+                description: cve.description,
+                cpeMatches: cve.cpeMatches,
+                publishedDate: cve.publishedDate,
+                inKEV: cve.inKEV,
+                kevDateAdded: cve.kevDateAdded,
+                kevDueDate: cve.kevDueDate,
+                kevRansomwareUse: cve.kevRansomwareUse,
+              })),
+              skipDuplicates: true,
+            });
+          }
+          await prisma.article.update({
+            where: { id: article.id },
+            data: { cvesExtracted: true },
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[DigestV2] CVE storage failed for "${article.title}": ${msg}`);
+        }
+      }
+    }
+
     // ── Step 6: Group and brief ──
     await groupAndBriefUngrouped(prisma, userId, signalMap, result);
   } catch (err) {
@@ -274,6 +321,7 @@ async function groupAndBriefUngrouped(
         include: {
           entities: true,
           articleSignals: { include: { industrySignal: true } },
+          cves: { select: { cveId: true, cvssScore: true, severity: true, description: true, inKEV: true, kevDueDate: true } },
         },
       },
     },
@@ -353,6 +401,14 @@ async function groupAndBriefUngrouped(
             signals: ua.article.articleSignals.map((as) => ({
               slug: as.industrySignal.slug,
               name: as.industrySignal.name,
+            })),
+            cves: ua.article.cves.map((c) => ({
+              cveId: c.cveId,
+              cvssScore: c.cvssScore,
+              severity: c.severity,
+              description: c.description,
+              inKEV: c.inKEV,
+              kevDueDate: c.kevDueDate,
             })),
           }));
 

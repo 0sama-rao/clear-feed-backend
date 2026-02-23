@@ -15,6 +15,14 @@ export interface GroupBriefingInput {
     author: string | null;
     entities: Array<{ type: string; name: string }>;
     signals: Array<{ slug: string; name: string }>;
+    cves?: Array<{
+      cveId: string;
+      cvssScore: number | null;
+      severity: string | null;
+      description: string | null;
+      inKEV: boolean;
+      kevDueDate: Date | null;
+    }>;
   }>;
 }
 
@@ -76,6 +84,28 @@ export async function generateGroupBriefing(
       .map(([type, names]) => `${type}: ${[...names].join(", ")}`)
       .join("\n");
     const signalSummary = [...allSignals].join(", ");
+
+    // Build CVE context from enriched data
+    const allCVEs = new Map<string, { cvssScore: number | null; severity: string | null; inKEV: boolean; kevDueDate: Date | null; description: string | null }>();
+    for (const a of input.articles) {
+      for (const cve of a.cves ?? []) {
+        if (!allCVEs.has(cve.cveId)) {
+          allCVEs.set(cve.cveId, cve);
+        }
+      }
+    }
+    const cveSummary = allCVEs.size > 0
+      ? [...allCVEs.entries()]
+          .map(([id, data]) => {
+            const parts = [id];
+            if (data.cvssScore !== null) parts.push(`CVSS ${data.cvssScore}`);
+            if (data.severity) parts.push(data.severity);
+            if (data.inKEV) parts.push("CISA KEV LISTED");
+            if (data.kevDueDate) parts.push(`KEV deadline: ${data.kevDueDate.toISOString().split("T")[0]}`);
+            return parts.join(" | ");
+          })
+          .join("\n")
+      : "None identified";
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -202,6 +232,9 @@ Entities detected:
 ${entitySummary || "None"}
 
 Signals classified: ${signalSummary || "None"}
+
+CVE Intelligence:
+${cveSummary}
 
 ${combined}`,
         },

@@ -16,6 +16,17 @@ interface PeriodStats {
   topAffectedProducts: Array<{ name: string; count: number }>;
   topAffectedSectors: Array<{ name: string; count: number }>;
   topThreatActors: Array<{ name: string; count: number }>;
+  // CVE metrics
+  uniqueCVEs: number;
+  criticalCVEs: number;
+  highCVEs: number;
+  mediumCVEs: number;
+  lowCVEs: number;
+  kevCount: number;
+  avgCVSS: number | null;
+  maxCVSS: number | null;
+  topCVEs: Array<{ cveId: string; cvssScore: number | null; severity: string | null; inKEV: boolean; articleCount: number }>;
+  kevCVEs: Array<{ cveId: string; cvssScore: number | null; kevDueDate: Date | null }>;
 }
 
 const PERIOD_DAYS: Record<string, number> = {
@@ -71,6 +82,9 @@ export async function generatePeriodReport(
               articleSignals: {
                 include: { industrySignal: { select: { name: true, slug: true } } },
               },
+              cves: {
+                select: { cveId: true, cvssScore: true, severity: true, inKEV: true, kevDueDate: true, description: true },
+              },
             },
           },
         },
@@ -104,6 +118,13 @@ export async function generatePeriodReport(
         )
       ),
     ].slice(0, 15),
+    cves: [
+      ...new Map(
+        g.userArticles.flatMap((ua) =>
+          ua.article.cves.map((c) => [c.cveId, { cveId: c.cveId, cvssScore: c.cvssScore, severity: c.severity, inKEV: c.inKEV }] as const)
+        )
+      ).values(),
+    ],
   }));
 
   // Generate AI summary with period-specific prompt
@@ -145,6 +166,7 @@ function computeStats(
         articleSignals: Array<{
           industrySignal: { name: string; slug: string };
         }>;
+        cves: Array<{ cveId: string; cvssScore: number | null; severity: string | null; inKEV: boolean; kevDueDate: Date | null }>;
       };
     }>;
   }>,
@@ -222,6 +244,58 @@ function computeStats(
     storiesPerDay[day] = count;
   }
 
+  // CVE aggregation
+  const cveMap = new Map<string, { cvssScore: number | null; severity: string | null; inKEV: boolean; kevDueDate: Date | null; articleCount: number }>();
+  for (const group of groups) {
+    for (const ua of group.userArticles) {
+      for (const cve of ua.article.cves) {
+        const existing = cveMap.get(cve.cveId);
+        if (existing) {
+          existing.articleCount++;
+        } else {
+          cveMap.set(cve.cveId, {
+            cvssScore: cve.cvssScore,
+            severity: cve.severity,
+            inKEV: cve.inKEV,
+            kevDueDate: cve.kevDueDate,
+            articleCount: 1,
+          });
+        }
+      }
+    }
+  }
+
+  const allCVEs = [...cveMap.entries()];
+  const scores = allCVEs.filter(([_, c]) => c.cvssScore !== null).map(([_, c]) => c.cvssScore!);
+
+  const uniqueCVEs = allCVEs.length;
+  const criticalCVECount = allCVEs.filter(([_, c]) => c.cvssScore !== null && c.cvssScore >= 9.0).length;
+  const highCVECount = allCVEs.filter(([_, c]) => c.cvssScore !== null && c.cvssScore >= 7.0 && c.cvssScore < 9.0).length;
+  const mediumCVECount = allCVEs.filter(([_, c]) => c.cvssScore !== null && c.cvssScore >= 4.0 && c.cvssScore < 7.0).length;
+  const lowCVECount = allCVEs.filter(([_, c]) => c.cvssScore !== null && c.cvssScore < 4.0).length;
+  const kevCount = allCVEs.filter(([_, c]) => c.inKEV).length;
+  const avgCVSS = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+  const maxCVSS = scores.length > 0 ? Math.max(...scores) : null;
+
+  const topCVEs = allCVEs
+    .sort((a, b) => (b[1].cvssScore ?? 0) - (a[1].cvssScore ?? 0))
+    .slice(0, 10)
+    .map(([cveId, data]) => ({
+      cveId,
+      cvssScore: data.cvssScore,
+      severity: data.severity,
+      inKEV: data.inKEV,
+      articleCount: data.articleCount,
+    }));
+
+  const kevCVEs = allCVEs
+    .filter(([_, c]) => c.inKEV)
+    .map(([cveId, data]) => ({
+      cveId,
+      cvssScore: data.cvssScore,
+      kevDueDate: data.kevDueDate,
+    }));
+
   return {
     totalStories,
     totalArticles: groups.reduce((sum, g) => sum + g.userArticles.length, 0),
@@ -235,6 +309,16 @@ function computeStats(
     topAffectedProducts,
     topAffectedSectors,
     topThreatActors,
+    uniqueCVEs,
+    criticalCVEs: criticalCVECount,
+    highCVEs: highCVECount,
+    mediumCVEs: mediumCVECount,
+    lowCVEs: lowCVECount,
+    kevCount,
+    avgCVSS,
+    maxCVSS,
+    topCVEs,
+    kevCVEs,
   };
 }
 
@@ -250,6 +334,7 @@ interface GroupInput {
   articleCount: number;
   signals: string[];
   entities: string[];
+  cves: Array<{ cveId: string; cvssScore: number | null; severity: string | null; inKEV: boolean }>;
 }
 
 const CASE_LABELS: Record<number, string> = {
@@ -265,11 +350,15 @@ function buildGroupContext(groups: GroupInput[]): string {
   const groupSummaries = sorted
     .map((g, i) => {
       const caseLabel = CASE_LABELS[g.caseType || 4] || "INFO";
+      const cveStr = g.cves.length > 0
+        ? g.cves.map((c) => `${c.cveId} (CVSS:${c.cvssScore ?? "?"}, ${c.severity ?? "?"}${c.inKEV ? ", KEV" : ""})`).join(", ")
+        : "None";
       const parts = [
         `--- Story ${i + 1} [${caseLabel}] (${g.articleCount} articles) ---`,
         `Title: ${g.title}`,
         `Signals: ${g.signals.join(", ") || "None"}`,
         `Entities: ${g.entities.join(", ") || "None"}`,
+        `CVEs: ${cveStr}`,
         `\nSynopsis:\n${g.synopsis}`,
       ];
       if (g.executiveSummary) parts.push(`\nKey Facts:\n${g.executiveSummary}`);
@@ -300,6 +389,8 @@ You will receive full briefings for each story group. Use ALL data to produce a 
 - Active signals: ${allSignals || "None"}
 - Top affected products: ${stats.topAffectedProducts.map((p) => p.name).join(", ") || "None identified"}
 - Top affected sectors: ${stats.topAffectedSectors.map((s) => s.name).join(", ") || "None identified"}
+- CVE Intelligence: ${stats.uniqueCVEs} unique CVEs mentioned, ${stats.criticalCVEs} critical (CVSS>=9.0), ${stats.highCVEs} high (CVSS>=7.0), ${stats.kevCount} on CISA KEV
+- Highest CVSS: ${stats.maxCVSS ?? "N/A"}, Average CVSS: ${stats.avgCVSS?.toFixed(1) ?? "N/A"}${stats.kevCVEs.length > 0 ? `\n- CISA KEV CVEs requiring action: ${stats.kevCVEs.map((k) => k.cveId).join(", ")}` : ""}
 
 ## OUTPUT STRUCTURE (return markdown)
 
@@ -374,6 +465,9 @@ You will receive full briefings for each story group this week. Synthesize them 
 - Active signals: ${allSignals || "None"}
 - Top products mentioned: ${stats.topAffectedProducts.map((p) => `${p.name} (${p.count})`).join(", ") || "None"}
 - Top sectors affected: ${stats.topAffectedSectors.map((s) => `${s.name} (${s.count})`).join(", ") || "None"}
+- CVE Summary: ${stats.uniqueCVEs} unique CVEs, ${stats.criticalCVEs} critical, ${stats.highCVEs} high, ${stats.kevCount} CISA KEV listed
+- Average CVSS: ${stats.avgCVSS?.toFixed(1) ?? "N/A"}, Peak CVSS: ${stats.maxCVSS ?? "N/A"}
+- Top CVEs: ${stats.topCVEs.slice(0, 5).map((c) => `${c.cveId} (CVSS ${c.cvssScore}${c.inKEV ? ", KEV" : ""})`).join(", ") || "None"}
 
 ## OUTPUT STRUCTURE (return markdown)
 
@@ -387,6 +481,11 @@ You will receive full briefings for each story group this week. Synthesize them 
 | Fixed / Resolved | ${stats.fixedStories} |
 | Informational | ${stats.infoStories} |
 | Total Articles Analyzed | ${stats.totalArticles} |
+| Unique CVEs Identified | ${stats.uniqueCVEs} |
+| Critical CVEs (CVSS >= 9.0) | ${stats.criticalCVEs} |
+| High CVEs (CVSS >= 7.0) | ${stats.highCVEs} |
+| CISA KEV Listed | ${stats.kevCount} |
+| Average CVSS Score | ${stats.avgCVSS?.toFixed(1) ?? "N/A"} |
 
 ### Key Developments This Week
 
@@ -474,6 +573,10 @@ You will receive full briefings for all story groups this month. Produce a strat
 - Top products mentioned: ${stats.topAffectedProducts.map((p) => `${p.name} (${p.count})`).join(", ") || "None"}
 - Top sectors affected: ${stats.topAffectedSectors.map((s) => `${s.name} (${s.count})`).join(", ") || "None"}
 - Top entities: ${stats.topEntities.map((e) => `${e.name} (${e.type}, ${e.count})`).join(", ") || "None"}
+- CVE Summary: ${stats.uniqueCVEs} unique CVEs, ${stats.criticalCVEs} critical (CVSS>=9.0), ${stats.highCVEs} high, ${stats.mediumCVEs} medium, ${stats.lowCVEs} low
+- CISA KEV: ${stats.kevCount} CVEs on Known Exploited Vulnerabilities list
+- CVSS Scores: Average ${stats.avgCVSS?.toFixed(1) ?? "N/A"}, Peak ${stats.maxCVSS ?? "N/A"}
+- Top CVEs by severity: ${stats.topCVEs.slice(0, 8).map((c) => `${c.cveId} (CVSS ${c.cvssScore}${c.inKEV ? ", KEV" : ""})`).join(", ") || "None"}
 
 ## OUTPUT STRUCTURE (return markdown)
 
@@ -487,6 +590,10 @@ You will receive full briefings for all story groups this month. Produce a strat
 | Vulnerable (Unpatched Exposure) | ${stats.vulnerableStories} |
 | Fixed / Resolved | ${stats.fixedStories} |
 | Informational / Research | ${stats.infoStories} |
+| Unique CVEs Identified | ${stats.uniqueCVEs} |
+| Critical CVEs (CVSS >= 9.0) | ${stats.criticalCVEs} |
+| CISA KEV Listed | ${stats.kevCount} |
+| Average CVSS Score | ${stats.avgCVSS?.toFixed(1) ?? "N/A"} |
 
 ### Executive Summary
 

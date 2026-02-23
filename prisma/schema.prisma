@@ -92,11 +92,13 @@ model Article {
   cleanText         String?   @db.Text
   externalLinks     String[]
   entitiesExtracted Boolean   @default(false)
+  cvesExtracted     Boolean   @default(false)
 
   source         Source          @relation(fields: [sourceId], references: [id], onDelete: Cascade)
   userArticles   UserArticle[]
   entities       ArticleEntity[]
   articleSignals ArticleSignal[]
+  cves           ArticleCVE[]
 }
 
 model UserArticle {
@@ -252,4 +254,29 @@ model PeriodReport {
 
   @@unique([userId, period])
   @@index([userId])
+}
+
+// ──────────────────────────────────────────
+// V3: CVE Enrichment (NVD + CISA KEV)
+// ──────────────────────────────────────────
+
+model ArticleCVE {
+  id               String    @id @default(uuid())
+  articleId        String
+  cveId            String
+  cvssScore        Float?
+  severity         String?
+  description      String?   @db.Text
+  cpeMatches       Json?
+  publishedDate    DateTime?
+  inKEV            Boolean   @default(false)
+  kevDateAdded     DateTime?
+  kevDueDate       DateTime?
+  kevRansomwareUse String?
+  enrichedAt       DateTime  @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@unique([articleId, cveId])
+  @@index([cveId])
 }
