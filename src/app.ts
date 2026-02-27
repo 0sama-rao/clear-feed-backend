@@ -11,6 +11,8 @@ import adminRoutes from "./routes/admin.js";
 import digestRoutes from "./routes/digest.js";
 import onboardingRoutes from "./routes/onboarding.js";
 import settingsRoutes from "./routes/settings.js";
+import techstackRoutes from "./routes/techstack.js";
+import exposureRoutes from "./routes/exposure.js";
 import { runScheduledDigests } from "./jobs/scheduledDigest.js";
 
 export async function buildApp() {
@@ -32,6 +34,8 @@ export async function buildApp() {
   await app.register(digestRoutes);
   await app.register(onboardingRoutes);
   await app.register(settingsRoutes);
+  await app.register(techstackRoutes);
+  await app.register(exposureRoutes);
 
   // Hourly scheduler — checks which users are due for their digest
   cron.schedule("0 * * * *", async () => {

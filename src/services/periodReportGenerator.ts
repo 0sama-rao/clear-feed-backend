@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 import type { PrismaClient } from "@prisma/client";
+import { computeRemediationMetrics, type RemediationMetrics } from "./remediationTracker.js";
+import { createPeriodSnapshot, computeTrendDeltas, type TrendDeltas, type SnapshotMetrics } from "./snapshotService.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -27,6 +29,11 @@ interface PeriodStats {
   maxCVSS: number | null;
   topCVEs: Array<{ cveId: string; cvssScore: number | null; severity: string | null; inKEV: boolean; articleCount: number }>;
   kevCVEs: Array<{ cveId: string; cvssScore: number | null; kevDueDate: Date | null }>;
+  // Exposure & remediation metrics (computed from UserCVEExposure)
+  exposure?: RemediationMetrics;
+  trends?: TrendDeltas | null;
+  topVulnerableStackItems?: Array<{ vendor: string; product: string; count: number }>;
+  exposureByCategory?: Record<string, number>;
 }
 
 const PERIOD_DAYS: Record<string, number> = {
@@ -94,6 +101,68 @@ export async function generatePeriodReport(
 
   // Compute stats from DB data (no AI)
   const stats = computeStats(groups, fromDate, toDate);
+
+  // Compute exposure & remediation metrics from UserCVEExposure
+  try {
+    const remediationMetrics = await computeRemediationMetrics(prisma, userId);
+    stats.exposure = remediationMetrics;
+
+    // Top vulnerable products from tech stack
+    const vulnerableByStack = await prisma.userCVEExposure.findMany({
+      where: { userId, exposureState: "VULNERABLE", techStackItemId: { not: null } },
+      include: { techStackItem: { select: { vendor: true, product: true, category: true } } },
+    });
+
+    const productMap = new Map<string, { vendor: string; product: string; count: number }>();
+    for (const exp of vulnerableByStack) {
+      if (exp.techStackItem) {
+        const key = `${exp.techStackItem.vendor}:${exp.techStackItem.product}`;
+        const existing = productMap.get(key);
+        if (existing) existing.count++;
+        else productMap.set(key, { vendor: exp.techStackItem.vendor, product: exp.techStackItem.product, count: 1 });
+      }
+    }
+    stats.topVulnerableStackItems = [...productMap.values()].sort((a, b) => b.count - a.count).slice(0, 10);
+
+    // Exposure by tech category
+    const catMap: Record<string, number> = {};
+    for (const exp of vulnerableByStack) {
+      if (exp.techStackItem) {
+        const cat = exp.techStackItem.category || "OTHER";
+        catMap[cat] = (catMap[cat] || 0) + 1;
+      }
+    }
+    stats.exposureByCategory = catMap;
+
+    // Compute trend deltas and store snapshot (for weekly/monthly)
+    if (period !== "1d") {
+      const snapshotMetrics: SnapshotMetrics = {
+        totalStories: stats.totalStories,
+        totalArticles: stats.totalArticles,
+        criticalStories: stats.criticalStories,
+        vulnerableStories: stats.vulnerableStories,
+        fixedStories: stats.fixedStories,
+        infoStories: stats.infoStories,
+        uniqueCVEs: stats.uniqueCVEs,
+        criticalCVEs: stats.criticalCVEs,
+        highCVEs: stats.highCVEs,
+        mediumCVEs: stats.mediumCVEs,
+        lowCVEs: stats.lowCVEs,
+        kevCount: stats.kevCount,
+        avgCVSS: stats.avgCVSS,
+        maxCVSS: stats.maxCVSS,
+        exposure: remediationMetrics,
+        exposureByCategory: catMap,
+        topVulnerableProducts: stats.topVulnerableStackItems || [],
+      };
+
+      stats.trends = await computeTrendDeltas(prisma, userId, period, snapshotMetrics);
+      await createPeriodSnapshot(prisma, userId, period, stats, remediationMetrics);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[PeriodReport] Exposure metrics failed for ${period}: ${msg}`);
+  }
 
   // Build group data for AI prompt
   const groupData = groups.map((g) => ({
@@ -337,6 +406,11 @@ interface GroupInput {
   cves: Array<{ cveId: string; cvssScore: number | null; severity: string | null; inKEV: boolean }>;
 }
 
+function formatDelta(delta: number, suffix: string = ""): string {
+  if (delta === 0) return `=${suffix}`;
+  return delta > 0 ? `+${delta}${suffix}` : `${delta}${suffix}`;
+}
+
 const CASE_LABELS: Record<number, string> = {
   1: "CRITICAL — Actively Exploited",
   2: "VULNERABLE — No Known Exploit",
@@ -391,6 +465,17 @@ You will receive full briefings for each story group. Use ALL data to produce a 
 - Top affected sectors: ${stats.topAffectedSectors.map((s) => s.name).join(", ") || "None identified"}
 - CVE Intelligence: ${stats.uniqueCVEs} unique CVEs mentioned, ${stats.criticalCVEs} critical (CVSS>=9.0), ${stats.highCVEs} high (CVSS>=7.0), ${stats.kevCount} on CISA KEV
 - Highest CVSS: ${stats.maxCVSS ?? "N/A"}, Average CVSS: ${stats.avgCVSS?.toFixed(1) ?? "N/A"}${stats.kevCVEs.length > 0 ? `\n- CISA KEV CVEs requiring action: ${stats.kevCVEs.map((k) => k.cveId).join(", ")}` : ""}
+${stats.exposure ? `
+## YOUR ORGANIZATION'S EXPOSURE (REAL DATA)
+- Currently VULNERABLE CVEs: ${stats.exposure.totalVulnerable}
+- Patched CVEs: ${stats.exposure.totalFixed}
+- Overdue remediations: ${stats.exposure.totalOverdue}
+- CVEs on CISA KEV affecting your stack: ${stats.exposure.kevExposureCount}
+- Overdue KEV remediations: ${stats.exposure.overdueKevCount}
+- Critical CVEs (CVSS>=9.0) affecting your stack: ${stats.exposure.criticalExposed}` : ""}
+${stats.topVulnerableStackItems?.length ? `
+## YOUR MOST EXPOSED PRODUCTS (REAL DATA)
+${stats.topVulnerableStackItems.map((p) => `- ${p.vendor} ${p.product}: ${p.count} open CVEs`).join("\n")}` : ""}
 
 ## OUTPUT STRUCTURE (return markdown)
 
@@ -436,9 +521,18 @@ A numbered list of SPECIFIC actions, ordered by urgency:
 4. [MEDIUM] Review ...
 5. [LOW] Awareness: ...
 
+${stats.exposure && stats.exposure.totalVulnerable > 0 ? `### Your Exposure Today
+
+Based on your technology stack matching, summarize which CVEs directly affect the organization:
+- Use the REAL data from "YOUR ORGANIZATION'S EXPOSURE" section above
+- List affected products with their open CVE counts
+- Flag overdue KEV remediations prominently
+- If no tech stack is configured, note that exposure tracking requires tech stack setup
+` : ""}
 CRITICAL RULES:
 - Use REAL CVE IDs, product names, versions, and IOCs from the briefing data
 - Do NOT fabricate or hallucinate — only reference what appears in the story data
+- Where REAL DATA sections are provided (marked as such), include those numbers VERBATIM
 - This is an OPERATIONAL daily brief — be specific, concise, actionable
 - No filler text or generic advice. Every line should reference real data
 - Return ONLY the markdown, no preamble or closing remarks`;
@@ -468,6 +562,31 @@ You will receive full briefings for each story group this week. Synthesize them 
 - CVE Summary: ${stats.uniqueCVEs} unique CVEs, ${stats.criticalCVEs} critical, ${stats.highCVEs} high, ${stats.kevCount} CISA KEV listed
 - Average CVSS: ${stats.avgCVSS?.toFixed(1) ?? "N/A"}, Peak CVSS: ${stats.maxCVSS ?? "N/A"}
 - Top CVEs: ${stats.topCVEs.slice(0, 5).map((c) => `${c.cveId} (CVSS ${c.cvssScore}${c.inKEV ? ", KEV" : ""})`).join(", ") || "None"}
+${stats.exposure ? `
+## YOUR ORGANIZATION'S EXPOSURE (REAL DATA)
+- Currently VULNERABLE CVEs: ${stats.exposure.totalVulnerable}
+- Patched CVEs: ${stats.exposure.totalFixed}
+- Patch Rate: ${stats.exposure.patchRate}%
+- SLA Compliance: ${stats.exposure.slaCompliance}%
+- Mean Time to Remediate (MTTR): ${stats.exposure.avgMttrDays?.toFixed(1) ?? "N/A"} days
+- Overdue remediations: ${stats.exposure.totalOverdue}
+- KEV CVEs affecting your stack: ${stats.exposure.kevExposureCount}
+- Overdue KEV: ${stats.exposure.overdueKevCount}` : ""}
+${stats.trends ? `
+## WEEK-OVER-WEEK COMPARISON (REAL DATA — include this table VERBATIM)
+| Metric | This Week | Last Week | Change |
+|---|---|---|---|
+| Total Stories | ${stats.trends.totalStories.current} | ${stats.trends.totalStories.previous} | ${formatDelta(stats.trends.totalStories.delta)} |
+| Critical Stories | ${stats.trends.criticalStories.current} | ${stats.trends.criticalStories.previous} | ${formatDelta(stats.trends.criticalStories.delta)} |
+| Unique CVEs | ${stats.trends.uniqueCVEs.current} | ${stats.trends.uniqueCVEs.previous} | ${formatDelta(stats.trends.uniqueCVEs.delta)} |
+| CISA KEV Listed | ${stats.trends.kevCount.current} | ${stats.trends.kevCount.previous} | ${formatDelta(stats.trends.kevCount.delta)} |
+| Your Vulnerable CVEs | ${stats.trends.vulnerableExposures.current} | ${stats.trends.vulnerableExposures.previous} | ${formatDelta(stats.trends.vulnerableExposures.delta)} |
+| Patch Rate | ${stats.trends.patchRate.current.toFixed(1)}% | ${stats.trends.patchRate.previous.toFixed(1)}% | ${formatDelta(Math.round(stats.trends.patchRate.delta * 10) / 10, "%")} |
+| SLA Compliance | ${stats.trends.slaCompliance.current.toFixed(1)}% | ${stats.trends.slaCompliance.previous.toFixed(1)}% | ${formatDelta(Math.round(stats.trends.slaCompliance.delta * 10) / 10, "%")} |
+| Avg MTTR | ${stats.trends.mttr.current?.toFixed(1) ?? "N/A"} days | ${stats.trends.mttr.previous?.toFixed(1) ?? "N/A"} days | ${formatDelta(Math.round(stats.trends.mttr.delta * 10) / 10, " days")} |` : ""}
+${stats.topVulnerableStackItems?.length ? `
+## YOUR MOST EXPOSED PRODUCTS (REAL DATA)
+${stats.topVulnerableStackItems.map((p) => `- ${p.vendor} ${p.product}: ${p.count} open CVEs`).join("\n")}` : ""}
 
 ## OUTPUT STRUCTURE (return markdown)
 
@@ -540,6 +659,24 @@ Prioritized action items synthesized from all stories:
 **Review & Awareness**
 - Post-patch validations, policy reviews, team briefing items from FIXED/INFO stories
 
+${stats.exposure && stats.exposure.totalVulnerable > 0 ? `### Patch Compliance Summary (REAL DATA — include VERBATIM)
+
+| Metric | Value |
+|---|---|
+| Open Vulnerable CVEs | ${stats.exposure.totalVulnerable} |
+| Patched This Period | ${stats.exposure.totalFixed} |
+| Patch Rate | ${stats.exposure.patchRate}% |
+| SLA Compliance | ${stats.exposure.slaCompliance}% |
+| Mean Time to Remediate | ${stats.exposure.avgMttrDays?.toFixed(1) ?? "N/A"} days |
+| Overdue Remediations | ${stats.exposure.totalOverdue} |
+| KEV CVEs Affecting Stack | ${stats.exposure.kevExposureCount} |
+
+After this table, analyze: is compliance improving or declining? What products account for most open vulnerabilities?
+` : ""}
+${stats.trends ? `### Week-over-Week Trend
+
+Include the WEEK-OVER-WEEK COMPARISON table from the input data VERBATIM. Then analyze the trends: which metrics improved, which worsened, and what the overall trajectory means.
+` : ""}
 ### Weekly Outlook
 
 3-4 sentences: What to watch next week. Reference unresolved threats, actors likely to continue, areas needing monitoring.
@@ -547,6 +684,7 @@ Prioritized action items synthesized from all stories:
 CRITICAL RULES:
 - Use REAL CVE IDs, product names, versions, actor names from the briefing data
 - Do NOT fabricate — only reference what appears in the story data
+- Where REAL DATA sections are provided (marked as such), include those numbers and tables VERBATIM
 - This is a TACTICAL weekly report — focus on trends and posture shifts, not just listing stories
 - The trends and risk assessment sections are the most important — they show PATTERNS not just events
 - Return ONLY the markdown, no preamble or closing remarks`;
@@ -577,6 +715,36 @@ You will receive full briefings for all story groups this month. Produce a strat
 - CISA KEV: ${stats.kevCount} CVEs on Known Exploited Vulnerabilities list
 - CVSS Scores: Average ${stats.avgCVSS?.toFixed(1) ?? "N/A"}, Peak ${stats.maxCVSS ?? "N/A"}
 - Top CVEs by severity: ${stats.topCVEs.slice(0, 8).map((c) => `${c.cveId} (CVSS ${c.cvssScore}${c.inKEV ? ", KEV" : ""})`).join(", ") || "None"}
+${stats.exposure ? `
+## YOUR ORGANIZATION'S EXPOSURE (REAL DATA)
+- Currently VULNERABLE CVEs: ${stats.exposure.totalVulnerable}
+- Patched CVEs: ${stats.exposure.totalFixed}
+- Patch Rate: ${stats.exposure.patchRate}%
+- SLA Compliance: ${stats.exposure.slaCompliance}%
+- Mean Time to Remediate (MTTR): ${stats.exposure.avgMttrDays?.toFixed(1) ?? "N/A"} days
+- Median MTTR: ${stats.exposure.medianMttrDays?.toFixed(1) ?? "N/A"} days
+- Overdue remediations: ${stats.exposure.totalOverdue}
+- Critical CVEs affecting stack: ${stats.exposure.criticalExposed}
+- KEV CVEs affecting stack: ${stats.exposure.kevExposureCount}
+- Overdue KEV: ${stats.exposure.overdueKevCount}` : ""}
+${stats.trends ? `
+## MONTH-OVER-MONTH COMPARISON (REAL DATA — include this table VERBATIM)
+| Metric | This Month | Last Month | Change |
+|---|---|---|---|
+| Total Stories | ${stats.trends.totalStories.current} | ${stats.trends.totalStories.previous} | ${formatDelta(stats.trends.totalStories.delta)} |
+| Critical Stories | ${stats.trends.criticalStories.current} | ${stats.trends.criticalStories.previous} | ${formatDelta(stats.trends.criticalStories.delta)} |
+| Unique CVEs | ${stats.trends.uniqueCVEs.current} | ${stats.trends.uniqueCVEs.previous} | ${formatDelta(stats.trends.uniqueCVEs.delta)} |
+| CISA KEV Listed | ${stats.trends.kevCount.current} | ${stats.trends.kevCount.previous} | ${formatDelta(stats.trends.kevCount.delta)} |
+| Your Vulnerable CVEs | ${stats.trends.vulnerableExposures.current} | ${stats.trends.vulnerableExposures.previous} | ${formatDelta(stats.trends.vulnerableExposures.delta)} |
+| Patch Rate | ${stats.trends.patchRate.current.toFixed(1)}% | ${stats.trends.patchRate.previous.toFixed(1)}% | ${formatDelta(Math.round(stats.trends.patchRate.delta * 10) / 10, "%")} |
+| SLA Compliance | ${stats.trends.slaCompliance.current.toFixed(1)}% | ${stats.trends.slaCompliance.previous.toFixed(1)}% | ${formatDelta(Math.round(stats.trends.slaCompliance.delta * 10) / 10, "%")} |
+| Avg MTTR | ${stats.trends.mttr.current?.toFixed(1) ?? "N/A"} days | ${stats.trends.mttr.previous?.toFixed(1) ?? "N/A"} days | ${formatDelta(Math.round(stats.trends.mttr.delta * 10) / 10, " days")} |` : ""}
+${stats.exposureByCategory && Object.keys(stats.exposureByCategory).length > 0 ? `
+## EXPOSURE BY TECHNOLOGY CATEGORY (REAL DATA)
+${Object.entries(stats.exposureByCategory).sort((a, b) => b[1] - a[1]).map(([cat, count]) => `- ${cat}: ${count} vulnerable CVEs`).join("\n")}` : ""}
+${stats.topVulnerableStackItems?.length ? `
+## YOUR MOST EXPOSED PRODUCTS (REAL DATA)
+${stats.topVulnerableStackItems.map((p) => `- ${p.vendor} ${p.product}: ${p.count} open CVEs`).join("\n")}` : ""}
 
 ## OUTPUT STRUCTURE (return markdown)
 
@@ -642,6 +810,22 @@ Summarize any recurring threat actors, nation-state activity, or organized campa
 **Most Targeted Products & Sectors**
 Which products and sectors appeared most frequently in vulnerability and incident reports.
 
+${stats.exposure ? `### Remediation Maturity Assessment (REAL DATA — include VERBATIM)
+
+| Metric | Value | Status |
+|---|---|---|
+| Patch Rate | ${stats.exposure.patchRate}% | ${stats.exposure.patchRate >= 80 ? "Good" : stats.exposure.patchRate >= 60 ? "Needs Improvement" : "Critical"} |
+| SLA Compliance | ${stats.exposure.slaCompliance}% | ${stats.exposure.slaCompliance >= 80 ? "Good" : stats.exposure.slaCompliance >= 60 ? "Needs Improvement" : "Critical"} |
+| Mean Time to Remediate | ${stats.exposure.avgMttrDays?.toFixed(1) ?? "N/A"} days | ${stats.exposure.avgMttrDays != null && stats.exposure.avgMttrDays <= 7 ? "Good" : stats.exposure.avgMttrDays != null && stats.exposure.avgMttrDays <= 14 ? "Needs Improvement" : "Critical"} |
+| Overdue Remediations | ${stats.exposure.totalOverdue} | ${stats.exposure.totalOverdue === 0 ? "Good" : "Needs Attention"} |
+| KEV Exposure | ${stats.exposure.kevExposureCount} CVEs | ${stats.exposure.kevExposureCount === 0 ? "Good" : "Critical"} |
+
+After this table, provide analysis on remediation maturity trajectory and investment recommendations.
+` : ""}
+${stats.trends ? `### Month-over-Month Trend
+
+Include the MONTH-OVER-MONTH COMPARISON table from the input data VERBATIM. Then analyze whether the security posture is improving or deteriorating.
+` : ""}
 ### Month-over-Month Trend Analysis
 
 Identify 3-4 key trends with supporting evidence from the stories:
@@ -673,6 +857,7 @@ CRITICAL RULES:
 - This is a BOARD-LEVEL report — NO raw CVE lists, NO technical implementation details
 - Focus on SYSTEMIC TRENDS and INVESTMENT GUIDANCE
 - Only reference real data from the provided stories — do NOT fabricate
+- Where REAL DATA sections are provided (marked as such), include those numbers and tables VERBATIM
 - Every observation must be supported by evidence from the story data
 - The tone should be executive: clear, decisive, forward-looking
 - Return ONLY the markdown, no preamble or closing remarks`;

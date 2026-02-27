@@ -43,13 +43,16 @@ model User {
   lastDigestAt    DateTime?
   emailEnabled    Boolean   @default(false)
 
-  sources       Source[]
-  keywords      Keyword[]
-  userArticles  UserArticle[]
-  refreshTokens RefreshToken[]
-  newsGroups    NewsGroup[]
-  periodReports PeriodReport[]
-  industry      Industry? @relation(fields: [industryId], references: [id])
+  sources         Source[]
+  keywords        Keyword[]
+  userArticles    UserArticle[]
+  refreshTokens   RefreshToken[]
+  newsGroups      NewsGroup[]
+  periodReports   PeriodReport[]
+  techStack       TechStackItem[]
+  cveExposures    UserCVEExposure[]
+  periodSnapshots PeriodSnapshot[]
+  industry        Industry? @relation(fields: [industryId], references: [id])
 }
 
 model Source {
@@ -275,8 +278,87 @@ model ArticleCVE {
   kevRansomwareUse String?
   enrichedAt       DateTime  @default(now())
 
-  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  article   Article           @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  exposures UserCVEExposure[]
 
   @@unique([articleId, cveId])
   @@index([cveId])
+}
+
+// ──────────────────────────────────────────
+// V4: Tech Stack & CVE Exposure Management
+// ──────────────────────────────────────────
+
+enum TechCategory {
+  EDGE_DEVICE
+  NETWORK
+  OS
+  APPLICATION
+  CLOUD
+  IDENTITY
+  DATABASE
+  LIBRARY
+  OTHER
+}
+
+enum ExposureState {
+  VULNERABLE
+  FIXED
+  NOT_APPLICABLE
+  INDIRECT
+}
+
+model TechStackItem {
+  id         String       @id @default(uuid())
+  userId     String
+  vendor     String
+  product    String
+  version    String?
+  category   TechCategory @default(APPLICATION)
+  cpePattern String?
+  active     Boolean      @default(true)
+  createdAt  DateTime     @default(now())
+
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exposures UserCVEExposure[]
+
+  @@unique([userId, vendor, product, version])
+  @@index([userId])
+}
+
+model UserCVEExposure {
+  id                  String        @id @default(uuid())
+  userId              String
+  cveId               String
+  articleCveId        String?
+  techStackItemId     String?
+  exposureState       ExposureState @default(VULNERABLE)
+  autoClassified      Boolean       @default(true)
+  matchedCpe          String?
+  firstDetectedAt     DateTime      @default(now())
+  patchedAt           DateTime?
+  remediationDeadline DateTime?
+  notes               String?       @db.Text
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  articleCve    ArticleCVE?    @relation(fields: [articleCveId], references: [id], onDelete: SetNull)
+  techStackItem TechStackItem? @relation(fields: [techStackItemId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, cveId])
+  @@index([userId, exposureState])
+}
+
+model PeriodSnapshot {
+  id       String   @id @default(uuid())
+  userId   String
+  period   String
+  snapDate DateTime
+  metrics  Json
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, period, snapDate])
+  @@index([userId, period, snapDate])
 }

@@ -7,6 +7,7 @@ import { groupArticles, type ArticleForGrouping } from "../services/grouper.js";
 import { generateGroupBriefing } from "../services/briefingGenerator.js";
 import { generatePeriodReport, generateAllPeriodReports } from "../services/periodReportGenerator.js";
 import { enrichArticleCVEs } from "../services/cveExtractor.js";
+import { matchCVEsAgainstStack } from "../services/cpeMatcher.js";
 import type { DigestResult } from "./dailyDigest.js";
 
 const CONTENT_BATCH_SIZE = 15; // parallel content extractions (HTTP fetches)
@@ -283,6 +284,62 @@ export async function runDigestForUserV2(
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[DigestV2] CVE storage failed for "${article.title}": ${msg}`);
         }
+      }
+    }
+
+    // ── Step 5b: Match CVEs against user's tech stack ──
+    const techStack = await prisma.techStackItem.findMany({
+      where: { userId, active: true },
+      select: { id: true, vendor: true, product: true, version: true },
+    });
+
+    if (techStack.length > 0) {
+      console.log(`[DigestV2] User ${userId}: Matching CVEs against ${techStack.length} tech stack items...`);
+
+      const userArticleIds = storedArticles.map((a) => a.articleId);
+      const articleCves = await prisma.articleCVE.findMany({
+        where: { articleId: { in: userArticleIds } },
+        select: { id: true, cveId: true, cpeMatches: true, kevDueDate: true },
+      });
+
+      // Get existing exposures to skip already-processed CVEs
+      const existingExposures = await prisma.userCVEExposure.findMany({
+        where: { userId },
+        select: { cveId: true },
+      });
+      const existingCveIds = new Set(existingExposures.map((e) => e.cveId));
+      const newArticleCves = articleCves.filter((ac) => !existingCveIds.has(ac.cveId));
+
+      if (newArticleCves.length > 0) {
+        const exposureCandidates = matchCVEsAgainstStack(techStack, newArticleCves);
+
+        let created = 0;
+        for (const candidate of exposureCandidates) {
+          try {
+            await prisma.userCVEExposure.upsert({
+              where: { userId_cveId: { userId, cveId: candidate.cveId } },
+              update: {},
+              create: {
+                userId,
+                cveId: candidate.cveId,
+                articleCveId: candidate.articleCveId,
+                techStackItemId: candidate.techStackItemId,
+                exposureState: candidate.exposureState as any,
+                matchedCpe: candidate.matchedCpe,
+                remediationDeadline: candidate.remediationDeadline,
+                autoClassified: true,
+              },
+            });
+            created++;
+          } catch (err) {
+            if (!isDuplicateError(err)) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(`[DigestV2] Exposure creation failed for ${candidate.cveId}: ${msg}`);
+            }
+          }
+        }
+
+        console.log(`[DigestV2] User ${userId}: Created ${created} exposure records (${exposureCandidates.length} candidates).`);
       }
     }
 
